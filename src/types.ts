@@ -39,6 +39,8 @@ export interface ApiKeyRow {
   key_hash: string;
   key_prefix: string;
   key_last4: string;
+  /** null = 全部模型；JSON 数组 = 仅指定模型（空数组禁止全部）。 */
+  allowed_models: string | null;
   status: string;
   quota_usd: number;
   used_usd: number;

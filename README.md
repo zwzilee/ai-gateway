@@ -2,6 +2,12 @@
 
 跑在 Cloudflare Workers 上的 AI 聚合网关：把多个 OpenAI 兼容上游聚合成一个入口，对外提供标准 OpenAI 协议，自带多用户密钥、精确计费、额度控制和可视化管理后台。
 
+## API Key 模型限制（本地修改版）
+
+创建或编辑 API Key 时可选择“全部模型”或“指定模型”。模型列表按 Key 过滤，越权调用返回 403。现有 Key 默认保留全部模型权限；升级后可逐个修改。
+
+使用规则、管理 API 和 Cloudflare 升级步骤见 [API Key 模型授权与部署](docs/API_KEY_MODEL_ACCESS.md)。
+
 ## 🚀 部署
 
 全程**不需要填任何 ID**：D1 库会自动查找，没有就创建。

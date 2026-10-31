@@ -30,6 +30,7 @@ import { decryptSecret, encryptSecret, generateApiKey, sha256Hex } from '../lib/
 import { all, first, getSetting, paginate, run, setSetting } from '../lib/db.js';
 import { ApiError, badRequest, conflict, forbidden, notFound, unauthorized } from '../lib/errors.js';
 import { DAY_MS } from '../lib/maintenance.js';
+import { parseAllowedModels, validateAllowedModels } from '../lib/modelAccess.js';
 import { probeModels } from '../lib/upstream.js';
 import {
   fetchChannelBalance,
@@ -1081,6 +1082,7 @@ adminApi.get('/keys', async (c) => {
       name: k.name,
       // 明文不入库，列表只展示前缀与尾号
       key_display: `${k.key_prefix}...${k.key_last4}`,
+      allowed_models: parseAllowedModels(k.allowed_models),
       status: k.status,
       quota_usd: k.quota_usd,
       used_usd: k.used_usd,
@@ -1109,8 +1111,8 @@ adminApi.post('/keys', async (c) => {
 
   const result = await env.DB.prepare(
     `INSERT INTO api_keys (user_id, name, key_hash, key_prefix, key_last4, status, quota_usd,
-                           used_usd, rpm_limit, expires_at, created_at)
-     VALUES (?,?,?,?,?,?,?,0,?,?,?)`,
+                           used_usd, rpm_limit, expires_at, created_at, allowed_models)
+     VALUES (?,?,?,?,?,?,?,0,?,?,?,?)`,
   )
     .bind(
       userId,
@@ -1123,6 +1125,9 @@ adminApi.post('/keys', async (c) => {
       asNumber(body.rpm_limit, 'rpm_limit', { min: 0, max: 100_000, fallback: 0 }),
       expiresAt,
       Date.now(),
+      body.allowed_models === undefined || body.allowed_models === null
+        ? null
+        : JSON.stringify(validateAllowedModels(body.allowed_models)),
     )
     .run();
 
@@ -1138,8 +1143,8 @@ adminApi.put('/keys/:id', async (c) => {
 
   const body = (await c.req.json()) as Record<string, unknown>;
   await env.DB.prepare(
-    `UPDATE api_keys SET name = ?, status = ?, quota_usd = ?, rpm_limit = ?, expires_at = ?
-      WHERE id = ?`,
+    `UPDATE api_keys SET name = ?, status = ?, quota_usd = ?, rpm_limit = ?, expires_at = ?,
+                         allowed_models = ? WHERE id = ?`,
   )
     .bind(
       body.name === undefined ? existing.name : asOptionalString(body.name, 'name', 100) ?? '',
@@ -1151,6 +1156,11 @@ adminApi.put('/keys/:id', async (c) => {
       body.expires_at === undefined || body.expires_at === null || body.expires_at === ''
         ? null
         : asNumber(body.expires_at, 'expires_at', { min: 0 }),
+      body.allowed_models === undefined
+        ? existing.allowed_models
+        : body.allowed_models === null
+          ? null
+          : JSON.stringify(validateAllowedModels(body.allowed_models)),
       id,
     )
     .run();

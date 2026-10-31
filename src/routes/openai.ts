@@ -16,6 +16,7 @@ import {
 } from '../lib/billing.js';
 import { all, first, getModel, recordUsage } from '../lib/db.js';
 import { ApiError, badRequest, errorResponse, notFound } from '../lib/errors.js';
+import { canUseModel, parseAllowedModels } from '../lib/modelAccess.js';
 import { proxyRequest } from '../lib/upstream.js';
 import type { Env, ModelRow, UsageEntry } from '../types.js';
 
@@ -31,8 +32,7 @@ const ALLOWED_ENDPOINTS = new Set([
 ]);
 
 export async function handleModels(request: Request, env: Env): Promise<Response> {
-  const auth = await authenticate(request, env);
-  void auth;
+  const { ctx: auth } = await authenticate(request, env);
 
   const models = await all<ModelRow>(
     env.DB.prepare('SELECT * FROM models WHERE enabled = 1 ORDER BY id ASC'),
@@ -46,7 +46,11 @@ export async function handleModels(request: Request, env: Env): Promise<Response
    * 只要存在 allow_all_models 的启用渠道，就等于全部模型都能透传。
    */
   const servable = await servableModels(env);
-  const visible = servable ? models.filter((m) => servable.has(m.id)) : models;
+  const allowed = parseAllowedModels(auth.key.allowed_models);
+  const allowedSet = allowed === null ? null : new Set(allowed);
+  const visible = models.filter(
+    (m) => (!servable || servable.has(m.id)) && (!allowedSet || allowedSet.has(m.id)),
+  );
 
   return Response.json({
     object: 'list',
@@ -161,6 +165,16 @@ export async function handleProxy(
     }
     model = rawModel.trim();
     stream = body.stream === true ? 1 : 0;
+
+    if (!canUseModel(auth.key.allowed_models, model)) {
+      throw new ApiError(
+        403,
+        `此 API Key 无权使用模型「${model}」`,
+        'permission_error',
+        'model_not_allowed',
+        'model',
+      );
+    }
 
     const modelRow = await getModel(env.DB, model);
     if (!modelRow || modelRow.enabled !== 1) {
