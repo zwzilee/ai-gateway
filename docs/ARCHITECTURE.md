@@ -76,7 +76,8 @@ src/
     db.ts           all / first / run / batch / paginate / recordUsage / getSetting / setSetting
     auth.ts         下游 Key 解析与校验、额度检查、原子预扣 reserveQuota
     adminAuth.ts    管理会话签发与校验、登录失败计数与回收
-    upstream.ts     渠道选择、URL 拼接、请求构造、SSE 转发与空闲看门狗、用量解析、渠道探测
+    protocols.ts    渠道能力标记（chat / responses / anthropic）与「上游要求换协议」识别
+    upstream.ts     渠道选择（能力优先排序）、URL 拼接、请求构造、SSE 转发与空闲看门狗、用量解析、渠道探测
     upstreamBalance.ts  上游余额查询（DeepSeek / OpenRouter / Moonshot / 硅基流动 / 通用约定）
     billing.ts      usage 提取、字符估算、缓存命中识别、computeCost
     ratelimit.ts    RPM 内存限流、登录失败窗口常量
@@ -108,7 +109,8 @@ client ──▶ index.ts (折叠 /v1 前缀)
         ──▶ routes/openai.handleProxy
               1. authenticate()        解析 Key（三种写法）→ sha256 → 查 api_keys + users
                                        → 状态 / 过期 / 额度 / RPM
-              2. 白名单                 仅 chat/completions、completions、embeddings、moderations
+              2. 白名单                 仅 chat/completions、completions、embeddings、moderations、
+                                       responses、messages
               3. 解析 body              必须 application/json、必须有 model
               4. 模型启用校验           models.enabled = 1，否则 404 model_not_found
               5. reserveQuota()        按「输入估算 + 输出上限」原子预扣（仅有限额度时）
@@ -192,6 +194,41 @@ Claude Code、Cline、Anthropic SDK 只会说 Messages 协议，而上游聚合�
   估算返回 `{ input_tokens }` —— 客户端只用它决定是否压缩上下文。
 * 错误形状是 Anthropic 的 `{"type":"error","error":{type,message}}`（`anthropicErrorResponse`），
   回 OpenAI 的 `{"error":{…}}` 会让 Anthropic SDK 报「unexpected response」并吞掉错误信息。
+
+### 4.3.1 协议感知路由与双向降级
+
+同一份模型可能挂在多种上游上（有的只开 `/responses`、有的只开 `/messages`、有的只开
+`chat/completions`），而下游客户端又可能用任意一种协议开口。因此协议能力参与调度，且
+**两个方向都能翻译**：
+
+```
+下游端点            渠道能力                      实际动作
+/v1/chat/completions  chat                        原样透传
+                      responses（无 chat）          改写成 /responses，响应反译回 chat.completion
+                      anthropic（无 chat/responses）改写成 /messages，响应反译回 chat.completion
+/v1/responses         responses                     原样透传（SSE 原样回传）
+                      其余                          翻译成 chat 发出，响应翻成 Responses 事件流
+/v1/messages          anthropic                     原样透传（x-api-key + anthropic-version）
+                      其余                          翻译成 chat 发出，响应翻成 Messages 事件流
+```
+
+要点：
+
+* **能力只影响顺序，不做硬筛**：`selectChannels(env, model, capability)` 把声明了该能力的
+  渠道排到前面（打标记 + 稳定排序，不破坏同优先级内的加权随机），其余渠道仍然兜底 ——
+  用户手填的能力标注可能是错的，多试一个渠道远好于误报「无可用渠道」。
+* **失败可自愈**：每个改写后的路由都带 `failover: protocolMismatch`。上游回
+  「请改用 /v1/xxx」这类 400/404/415 时，`attemptChannel` 不把错误交给调用方，而是记下
+  `skipped.push('渠道名（要求改用 /v1/responses）')` 并换下一个渠道；全部失败后的报错里
+  会附上「不接这次请求的渠道」清单，排查时一眼能看出每个上游各为什么被跳过。
+* **反向翻译的状态机**与正向共用一套吸收器：`responsesStreamToChat` /
+  `anthropicStreamToChat` 逐事件产出文本、思考、工具调用增量，流式下游边收边发，
+  非流式下游在同一个流程里聚合后返回整包（保证两条路径产出一致）。上游无视 `stream:true`
+  直接回整包 JSON 时同样能折叠 —— 这两种形状在真实中转上都会遇到。
+* **用量口径**：反译路径的 usage 从原生事件里取（Responses 的 `response.usage`、
+  Messages 的 `message_start.message.usage` + `message_delta.usage` 合并），取不到时
+  退回估算并标 `estimated`；反译函数允许返回空用量，路由层补成估算空用量再交给结算，
+  避免结算读到 `null`。
 
 ### 4.4 `/v1/models`
 

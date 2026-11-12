@@ -29,6 +29,7 @@ import { encryptionKey } from './bootstrap.js';
 import { decryptSecret } from './crypto.js';
 import { all } from './db.js';
 import { ApiError, clientClosed, upstreamError } from './errors.js';
+import { channelProtocols } from './protocols.js';
 import type { ChannelRow, Env } from '../types.js';
 
 /**
@@ -69,7 +70,18 @@ export interface ChannelCandidate {
 
 // ---------------------------------------------------------------- 渠道选择
 
-export async function selectChannels(env: Env, model: string): Promise<ChannelCandidate[]> {
+/**
+ * @param requireCapability 只保留声明了该能力的渠道（可选）。
+ *
+ * 协议感知调度的第一层：下游要 Claude / Responses 原生时，明确标了这份能力的渠道
+ * 排在前面优先尝试。第二层在路由钩子里 —— 剩余渠道里还能走翻译的也要被算作候选，
+ * 否则「同一模型、上游各说一种协议」时会白白报没有可用渠道。
+ */
+export async function selectChannels(
+  env: Env,
+  model: string,
+  requireCapability?: string,
+): Promise<ChannelCandidate[]> {
   const now = Date.now();
   // 候选渠道在 SQL 里就筛掉：渠道多时（几十个上游）只有真正支持该模型的那几个会被读出来，
   // 而不是把整张 channels 表（含加密后的密钥串）全量取回 Worker 再过滤。
@@ -86,6 +98,22 @@ export async function selectChannels(env: Env, model: string): Promise<ChannelCa
   );
   if (channels.length === 0) return [];
 
+  /*
+   * 能力优先：声明了该协议的渠道放前面。能力只影响「先试谁」，不影响可用性判断，
+   * 最终能否服务由路由钩子按渠道逐个判定（见 protocols.ts）。
+   *
+   * 注意这里用「打标记 + 稳定排序」而不是 sort 内的比较器直接减：priority 的分组
+   * 排序在下面还会按 priority 重排一次，若在这里把同 priority 的渠道顺序打乱成
+   * 两极，weightedShuffle 之前就已经少了随机性。先标记，再连同优先标志一起分组。
+   */
+  const preferred =
+    requireCapability === undefined
+      ? channels
+      : [...channels]
+          .map((channel) => ({ channel, fits: channelProtocols(channel).has(requireCapability) }))
+          .sort((a, b) => (a.fits === b.fits ? 0 : a.fits ? -1 : 1))
+          .map((entry) => entry.channel);
+
   const mappings = await all<{ channel_id: number; upstream_model: string }>(
     env.DB.prepare('SELECT channel_id, upstream_model FROM channel_models WHERE model = ?').bind(
       model,
@@ -95,7 +123,7 @@ export async function selectChannels(env: Env, model: string): Promise<ChannelCa
   for (const m of mappings) mapping.set(m.channel_id, m.upstream_model);
 
   const candidates: ChannelCandidate[] = [];
-  for (const channel of channels) {
+  for (const channel of preferred) {
     const mapped = mapping.get(channel.id);
     if (mapped) {
       candidates.push({ channel, upstreamModel: mapped });
@@ -569,6 +597,13 @@ export interface ProxyOptions {
    * 是上游没有 responses 端点（404），此时直接换下一个渠道，不被计成渠道故障。
    */
   route?: (ctx: RouteContext) => RouteTarget | null;
+  /**
+   * 下游协议需要的能力（'responses' / 'anthropic' ……）。
+   *
+   * 标明之后：声明了这份能力的渠道优先尝试（能力感知的渠道路由），
+   * 剩余渠道再交给 route 钩子逐个体检，能翻译的照样是候选。
+   */
+  capability?: string;
 }
 
 export interface RouteContext {
@@ -593,6 +628,13 @@ export interface RouteTarget {
   auth?: 'bearer' | 'x-api-key';
   /** 该端点专属的附加请求头（如 anthropic-version），会覆盖渠道附加头 */
   headers?: Record<string, string>;
+  /**
+   * 该渠道不认这次请求的形态时，换下一个渠道并给出「缺什么」，而不是回 4xx。
+   *
+   * 与 fallbackOnMissingEndpoint 的区别：那个只认 404/405；这个由 provider 自己判定
+   * 上游体的错误是不是「协议/端点不对」，是则整轮请求换渠道重投。
+   */
+  failover?: (status: number, body: string) => string | null;
 }
 
 export interface ProxyOutcome {
@@ -604,15 +646,24 @@ export interface ProxyOutcome {
   attempts: number;
   /** 实际打到的上游端点（翻译层据此判断要不要反向转换） */
   endpoint: string;
+  /**
+   * 降级链：被跳过的渠道与原因。
+   *
+   * 只用于错误提示。整轮失败时能把「哪个渠道因为什么不接」原样带出来，
+   * 不再只有一句「没有可用渠道」。
+   */
+  skipped?: string[];
 }
 
 export async function proxyRequest(env: Env, opts: ProxyOptions): Promise<ProxyOutcome> {
-  const candidates = await selectChannels(env, opts.model);
+  const candidates = await selectChannels(env, opts.model, opts.capability);
   if (candidates.length === 0) {
     throw upstreamError(`没有可用渠道支持模型「${opts.model}」，请检查渠道配置与模型映射`);
   }
 
   const errors: string[] = [];
+  // 被跳过的渠道（不认这个协议 / 明确让换别的端点）单独记一份，错误提示要用
+  const skipped: string[] = [];
   let attempts = 0;
   // 失败切换时同一份请求体不必反复序列化。键只取「端点 + 上游模型名 + 是否注入 usage」，
   // 其余字段都来自不可变的 opts.body
@@ -624,10 +675,10 @@ export async function proxyRequest(env: Env, opts: ProxyOptions): Promise<ProxyO
 
     attempts++;
     try {
-      const result = await attemptChannel(env, channel, upstreamModel, opts, bodyCache);
+      const result = await attemptChannel(env, channel, upstreamModel, opts, bodyCache, skipped);
       if (result) {
         await markChannelSuccess(env, channel);
-        return { ...result, channel, upstreamModel, attempts };
+        return { ...result, channel, upstreamModel, attempts, skipped };
       }
       errors.push(`${channel.name}: 上游返回可重试错误`);
     } catch (err) {
@@ -638,10 +689,9 @@ export async function proxyRequest(env: Env, opts: ProxyOptions): Promise<ProxyO
     }
   }
 
-  throw upstreamError(
-    `所有渠道均请求失败（尝试 ${attempts} 个渠道）：${errors.join('; ') || '未知错误'}`,
-    502,
-  );
+  const detail = errors.join('; ') || '未知错误';
+  const extra = skipped.length > 0 ? `；不接这次请求的渠道：${skipped.join('; ')}` : '';
+  throw upstreamError(`所有渠道均请求失败（尝试 ${attempts} 个渠道）：${detail}${extra}`, 502);
 }
 
 async function attemptChannel(
@@ -650,6 +700,7 @@ async function attemptChannel(
   upstreamModel: string,
   opts: ProxyOptions,
   bodyCache: Map<string, string>,
+  skipped: string[],
 ): Promise<Omit<ProxyOutcome, 'channel' | 'upstreamModel' | 'attempts'> | null> {
   // 端点与请求体由调用方（或路由解析器）决定：/v1/responses 在支持它的渠道上原样转发，
   // 在不支持的渠道上降级成 /v1/chat/completions 的请求体，响应由调用方再翻译回去。
@@ -663,7 +714,10 @@ async function attemptChannel(
         body: opts.body,
       })
     : { endpoint: opts.endpoint, body: opts.body };
-  if (!target) return null;
+  if (!target) {
+    skipped.push(`${channel.name}（协议不匹配）`);
+    return null;
+  }
 
   const url = buildUpstreamUrl(channel.base_url, target.endpoint);
   const headers = await buildUpstreamHeaders(channel, env, {
@@ -748,6 +802,20 @@ async function attemptChannel(
     // 路由降级：上游根本没有这个端点（404/405）时，换下一个渠道，而不是把渠道
     // 判成故障冷却掉 —— 渠道本身没坏，只是不认这个协议。
     if (target.fallbackOnMissingEndpoint && (upstream.status === 404 || upstream.status === 405)) {
+      skipped.push(`${channel.name}（没有 ${target.endpoint} 端点）`);
+      return null;
+    }
+
+    /*
+     * provider 自判「这个渠道不认这次请求的形态」。
+     *
+     * 最典型的是上游只支持某一个模型协议：有的网关对不认识的端点回 400 而不是 404，
+     * 原样回给调用方就成了「上游明明有这个模型、却说你模型不支持」的假故障。
+     * 这里换渠道重投；一个都不剩时才把第一次的拒绝理由原样报出来。
+     */
+    const mismatch = target.failover?.(upstream.status, detail) ?? null;
+    if (mismatch !== null) {
+      skipped.push(`${channel.name}（${mismatch}）`);
       return null;
     }
 

@@ -339,6 +339,627 @@ export function chatToAnthropicMessage(chat: Json, request: Json, model: string,
   };
 }
 
+// ================================================================ 反向：Chat 请求/响应 ↔ Messages
+
+/** 上游没带 anthropic-version 时的缺省版本（Anthropic 官方 SDK 的当前默认） */
+export const ANTHROPIC_VERSION = '2023-06-01';
+
+/** chat 的 content（字符串或分块）→ 纯文本，图片块给出占位说明 */
+function chatContentText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const part of content) {
+    if (typeof part === 'string') parts.push(part);
+    else if (isObject(part) && typeof part.text === 'string') parts.push(part.text);
+    else if (isObject(part) && str(part.type) === 'image_url') parts.push('[image]');
+  }
+  return parts.join('\n');
+}
+
+/** chat 的图片块 → Anthropic image 块（data URL 拆成 base64 源） */
+function chatImageBlock(part: Json): Json | null {
+  const image = isObject(part.image_url) ? part.image_url : null;
+  const url = image ? str(image.url) : '';
+  if (url === '') return null;
+  const match = /^data:([^;]+);base64,(.*)$/s.exec(url);
+  if (match && match[1] && match[2] !== undefined) {
+    return { type: 'image', source: { type: 'base64', media_type: match[1], data: match[2] } };
+  }
+  return { type: 'image', source: { type: 'url', url } };
+}
+
+function chatContentBlocks(content: unknown): Json[] {
+  if (typeof content === 'string') return content === '' ? [] : [{ type: 'text', text: content }];
+  if (!Array.isArray(content)) return [];
+  const out: Json[] = [];
+  for (const part of content) {
+    if (typeof part === 'string') {
+      if (part !== '') out.push({ type: 'text', text: part });
+      continue;
+    }
+    if (!isObject(part)) continue;
+    if (str(part.type) === 'image_url') {
+      const block = chatImageBlock(part);
+      if (block) out.push(block);
+    } else if (typeof part.text === 'string' && part.text !== '') {
+      out.push({ type: 'text', text: part.text });
+    }
+  }
+  return out;
+}
+
+/**
+ * Chat Completions 请求 → Anthropic Messages 请求（下游 chat、上游只有 /messages）。
+ *
+ * 一一对应地搬：system/developer → system、assistant.tool_calls → tool_use 块、
+ * role=tool → user 里的 tool_result 块、max_tokens 缺省补 4096（Messages 必填）、
+ * stop → stop_sequences、functions 工具 → input_schema 工具。
+ */
+export function toAnthropicRequest(body: Json, upstreamModel: string): Json {
+  const messages: Json[] = [];
+  const systemParts: string[] = [];
+  const rawMessages = Array.isArray(body.messages) ? body.messages : [];
+
+  for (const raw of rawMessages) {
+    if (!isObject(raw)) continue;
+    const role = str(raw.role) || 'user';
+    if (role === 'system' || role === 'developer') {
+      const text = chatContentText(raw.content);
+      if (text !== '') systemParts.push(text);
+      continue;
+    }
+    if (role === 'tool') {
+      messages.push({
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: str(raw.tool_call_id),
+            content: chatContentText(raw.content),
+          },
+        ],
+      });
+      continue;
+    }
+    if (role === 'assistant') {
+      const blocks = chatContentBlocks(raw.content);
+      const calls = Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
+      for (const call of calls) {
+        if (!isObject(call)) continue;
+        const fn = isObject(call.function) ? call.function : {};
+        blocks.push({
+          type: 'tool_use',
+          id: str(call.id) || anthropicId('toolu'),
+          name: str(fn.name),
+          input: parseArguments(str(fn.arguments)),
+        });
+      }
+      if (blocks.length === 0) blocks.push({ type: 'text', text: '' });
+      messages.push({ role: 'assistant', content: blocks });
+      continue;
+    }
+    const blocks = chatContentBlocks(raw.content);
+    messages.push({ role: 'user', content: blocks.length > 0 ? blocks : [{ type: 'text', text: '' }] });
+  }
+
+  const out: Json = {
+    model: upstreamModel,
+    messages,
+    max_tokens: num(body.max_tokens) ?? num(body.max_completion_tokens) ?? DEFAULT_MESSAGES_MAX_TOKENS,
+  };
+  if (systemParts.length > 0) out.system = systemParts.join('\n\n');
+  const temperature = num(body.temperature);
+  if (temperature !== undefined) out.temperature = temperature;
+  const topP = num(body.top_p);
+  if (topP !== undefined) out.top_p = topP;
+  if (body.stop !== undefined) {
+    const stop = Array.isArray(body.stop) ? body.stop.filter((s): s is string => typeof s === 'string') : null;
+    if (stop && stop.length > 0) out.stop_sequences = stop;
+    else if (typeof body.stop === 'string' && body.stop !== '') out.stop_sequences = [body.stop];
+  }
+
+  const tools = body.tools;
+  if (Array.isArray(tools)) {
+    const converted: Json[] = [];
+    for (const t of tools) {
+      if (!isObject(t) || str(t.type) !== 'function') continue;
+      const fn = isObject(t.function) ? t.function : {};
+      const tool: Json = {
+        name: str(fn.name),
+        input_schema: isObject(fn.parameters) ? fn.parameters : { type: 'object', properties: {} },
+      };
+      if (str(fn.description) !== '') tool.description = str(fn.description);
+      converted.push(tool);
+    }
+    if (converted.length > 0) {
+      out.tools = converted;
+      const choice = body.tool_choice;
+      if (choice === 'required') out.tool_choice = { type: 'any' };
+      else if (choice === 'auto') out.tool_choice = { type: 'auto' };
+      else if (choice === 'none') out.tool_choice = { type: 'none' };
+      else if (isObject(choice) && isObject(choice.function)) {
+        out.tool_choice = { type: 'tool', name: str(choice.function.name) };
+      }
+    }
+  }
+  return out;
+}
+
+/** Anthropic message（整包）→ chat.completion */
+export function anthropicToChat(message: Json, model: string): Json {
+  let text = '';
+  const toolCalls: Json[] = [];
+  const blocks = Array.isArray(message.content) ? message.content : [];
+  for (const raw of blocks) {
+    if (!isObject(raw)) continue;
+    const type = str(raw.type);
+    if (type === 'text') text += str(raw.text);
+    else if (type === 'tool_use') {
+      toolCalls.push({
+        id: str(raw.id) || anthropicId('call'),
+        type: 'function',
+        function: { name: str(raw.name), arguments: stringify(raw.input ?? {}) },
+      });
+    }
+  }
+
+  const out: Json = { role: 'assistant', content: toolCalls.length > 0 && text === '' ? null : text };
+  if (toolCalls.length > 0) out.tool_calls = toolCalls;
+
+  const stopReason = str(message.stop_reason);
+  const finishReason =
+    toolCalls.length > 0 ? 'tool_calls' : stopReason === 'max_tokens' ? 'length' : 'stop';
+  const usage = extractAnthropicUsage(message.usage);
+
+  return {
+    id: str(message.id).startsWith('chatcmpl') ? str(message.id) : `chatcmpl-${str(message.id) || anthropicId('msg')}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message: out, finish_reason: finishReason, logprobs: null }],
+    usage: usage
+      ? {
+          prompt_tokens: usage.promptTokens,
+          completion_tokens: usage.completionTokens,
+          total_tokens: usage.totalTokens,
+        }
+      : null,
+  };
+}
+
+/** Anthropic → chat 的单步增量（与 responses.ts 的 ChatDelta 同形状，便于共用外壳） */
+export interface AnthropicDelta {
+  text?: string;
+  thinking?: string;
+  /** index 是 Anthropic 的 content block 下标（工具块各占一个） */
+  tool?: { index: number; id: string; name: string; args: string };
+  stopReason?: string;
+  usage?: unknown;
+  error?: string;
+}
+
+/** 一条 Anthropic 流事件 → 增量（纯函数） */
+export function mapAnthropicStreamEvent(event: Json): AnthropicDelta {
+  const type = str(event.type);
+  if (type === 'content_block_start') {
+    const block = isObject(event.content_block) ? event.content_block : {};
+    if (str(block.type) === 'tool_use') {
+      return { tool: { index: num(event.index) ?? 0, id: str(block.id), name: str(block.name), args: '' } };
+    }
+    return {};
+  }
+  if (type === 'content_block_delta') {
+    const delta = isObject(event.delta) ? event.delta : {};
+    const kind = str(delta.type);
+    if (kind === 'text_delta') return { text: str(delta.text) };
+    if (kind === 'thinking_delta') return { thinking: str(delta.thinking) };
+    if (kind === 'input_json_delta') {
+      return { tool: { index: num(event.index) ?? 0, id: '', name: '', args: str(delta.partial_json) } };
+    }
+    return {};
+  }
+  /*
+   * message_start 里带第一次用量（input_tokens 只在这一帧出现），
+   * message_delta 只补 output_tokens —— 所以两帧的 usage 都要合并，不能只取后者。
+   */
+  if (type === 'message_start') {
+    const message = isObject(event.message) ? event.message : {};
+    return { usage: message.usage };
+  }
+  if (type === 'message_delta') {
+    const delta = isObject(event.delta) ? event.delta : {};
+    return { stopReason: str(delta.stop_reason), usage: event.usage };
+  }
+  if (type === 'error') {
+    const error = isObject(event.error) ? event.error : {};
+    return { error: str(error.message) || '上游在流中返回错误' };
+  }
+  return {};
+}
+
+export interface AnthropicToChatOptions {
+  model: string;
+  stream: boolean;
+  idleMs: number;
+  signal?: AbortSignal;
+}
+
+export interface AnthropicToChatResult {
+  response: Response;
+  usage: Promise<{ usage: TokenUsage | null; error: string | null }>;
+}
+
+/**
+ * Anthropic 事件流 → Chat Completions（流式或整包）。
+ *
+ * `event:` 行在这些实现里不一定可信，因此事件类型一律从 data 的 `type` 字段取；
+ * 上游直接回整包 message JSON（非流式、或被缓存层压成 JSON）也能吃。
+ */
+export function anthropicStreamToChat(
+  upstream: Response,
+  opts: AnthropicToChatOptions,
+): AnthropicToChatResult {
+  let settled = false;
+  let resolveUsage!: (v: { usage: TokenUsage | null; error: string | null }) => void;
+  const usage = new Promise<{ usage: TokenUsage | null; error: string | null }>((resolve) => {
+    resolveUsage = resolve;
+  });
+
+  const encoder = new TextEncoder();
+  const chunkId = `chatcmpl-${anthropicId('chat')}`;
+  const created = Math.floor(Date.now() / 1000);
+  const slots = new Map<number, number>();
+  const names = new Map<number, string>();
+  const calls = new Map<number, { id: string; args: string }>();
+  const callId = (tool: { index: number; id: string }): string =>
+    tool.id !== '' ? tool.id : `${chunkId}-call-${tool.index}`;
+  let content = '';
+  let thinking = '';
+  let stopReason = '';
+  let finalUsage: TokenUsage | null = null;
+  let streamError: string | null = null;
+  let finished = false;
+
+  const settle = (error: string | null): void => {
+    if (settled) return;
+    settled = true;
+    resolveUsage({ usage: finalUsage, error: error ?? streamError });
+  };
+
+  const finishReason = (): string =>
+    slots.size > 0 ? 'tool_calls' : stopReason === 'max_tokens' ? 'length' : 'stop';
+
+  const message = (): Json => {
+    const msg: Json = { role: 'assistant', content: slots.size > 0 && content === '' ? null : content };
+    if (thinking !== '') msg.reasoning_content = thinking;
+    if (slots.size > 0) {
+      msg.tool_calls = [...slots.entries()]
+        .sort((a, b) => a[1] - b[1])
+        .map(([blockIndex]) => {
+          const entry = calls.get(blockIndex);
+          return {
+            id: entry?.id ?? `${chunkId}-call-${blockIndex}`,
+            type: 'function',
+            function: { name: names.get(blockIndex) ?? '', arguments: entry?.args ?? '' },
+          };
+        });
+    }
+    return msg;
+  };
+
+  const chatUsage = (): Json | null =>
+    finalUsage
+      ? {
+          prompt_tokens: finalUsage.promptTokens,
+          completion_tokens: finalUsage.completionTokens,
+          total_tokens: finalUsage.totalTokens,
+        }
+      : null;
+
+  const chatBody = (): Json => ({
+    id: chunkId,
+    object: 'chat.completion',
+    created,
+    model: opts.model,
+    choices: [{ index: 0, message: message(), finish_reason: streamError ? 'stop' : finishReason(), logprobs: null }],
+    usage: chatUsage(),
+  });
+
+  const body = upstream.body;
+
+  /**
+   * 逐条产出增量。
+   *
+   * 事件类型一律从 data 里的 `type` 字段取（`event:` 行在这些实现里不总可信）；
+   * 上游直接回整包 message JSON（非流式、或被缓存层压成 JSON）也吃。
+   */
+  const iterate = async function* (): AsyncGenerator<{
+    text?: string;
+    thinking?: string;
+    tool?: { index: number; id: string; name: string; args: string };
+    stopReason?: string;
+    usage?: unknown;
+    error?: string;
+  }, void, undefined> {
+    if (!body) {
+      streamError = '上游返回了空响应体';
+      return;
+    }
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const disarm = (): void => {
+      if (idleTimer !== undefined) {
+        clearTimeout(idleTimer);
+        idleTimer = undefined;
+      }
+    };
+    let buffer = '';
+    let whole = '';
+    let sawSse = false;
+    let toolIndex = 0;
+    try {
+      for (;;) {
+        idleTimer = setTimeout(() => {
+          idleTimer = undefined;
+          void reader.cancel().catch(() => undefined);
+        }, opts.idleMs);
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try {
+          chunk = await reader.read();
+        } catch (err) {
+          streamError = `上游流式响应中断: ${err instanceof Error ? err.message : String(err)}`;
+          return;
+        } finally {
+          disarm();
+        }
+        if (chunk.done) break;
+        const piece = decoder.decode(chunk.value, { stream: true });
+        whole += piece;
+        buffer += piece.replace(/\r\n/g, '\n');
+        let nl: number;
+        while ((nl = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, nl);
+          buffer = buffer.slice(nl + 1);
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          sawSse = true;
+          const payload = trimmed.slice(5).trim();
+          if (payload === '' || payload === '[DONE]') continue;
+          let event: Json;
+          try {
+            const parsed = JSON.parse(payload) as unknown;
+            if (!isObject(parsed)) continue;
+            event = parsed;
+          } catch {
+            continue;
+          }
+          yield mapAnthropicStreamEvent(event);
+        }
+      }
+
+      if (!sawSse) {
+        // 整包 JSON（没有 SSE 行）：按 message 对象处理
+        let parsed: Json = {};
+        try {
+          const raw = JSON.parse(whole.trim()) as unknown;
+          if (isObject(raw)) parsed = raw;
+        } catch {
+          parsed = {};
+        }
+        if (isObject(parsed.content) || Array.isArray(parsed.content) || isObject(parsed.usage)) {
+          /*
+           * 整包 message：每个工具块一条完整增量（id/name/参数一次带全）。
+           * 下标按「第几个工具块」编号，与流式路径里 content block 的 index
+           * 在语义上对齐（都只用来给下游分配 tool_calls 的 index）。
+           */
+          for (const block of Array.isArray(parsed.content) ? parsed.content : []) {
+            if (!isObject(block)) continue;
+            const kind = str(block.type);
+            if (kind === 'text') yield { text: str(block.text) };
+            else if (kind === 'thinking') yield { thinking: str(block.thinking) };
+            else if (kind === 'tool_use') {
+              yield {
+                tool: {
+                  index: toolIndex++,
+                  id: str(block.id),
+                  name: str(block.name),
+                  args: stringify(block.input ?? {}),
+                },
+              };
+            }
+          }
+          yield { stopReason: str(parsed.stop_reason), usage: parsed.usage };
+        }
+      }
+    } finally {
+      disarm();
+      void reader.cancel().catch(() => undefined);
+    }
+  };
+
+  const absorb = (d: {
+    text?: string;
+    thinking?: string;
+    tool?: { index: number; id: string; name: string; args: string };
+    stopReason?: string;
+    usage?: unknown;
+    error?: string;
+  }): void => {
+    if (d.error) streamError = d.error;
+    if (d.text) content += d.text;
+    if (d.thinking) thinking += d.thinking;
+    if (d.stopReason !== undefined && d.stopReason !== '') stopReason = d.stopReason;
+    /*
+     * 流式里 input_tokens 与 output_tokens 分两帧到（message_start / message_delta），
+     * 直接覆盖会把前一次丢掉，这里按字段合并。
+     */
+    if (d.usage !== undefined) {
+      const part = extractAnthropicUsage(d.usage);
+      if (part) {
+        const base = finalUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0, estimated: false };
+        const promptTokens = Math.max(base.promptTokens, part.promptTokens);
+        const completionTokens = Math.max(base.completionTokens, part.completionTokens);
+        finalUsage = {
+          promptTokens,
+          completionTokens,
+          totalTokens: promptTokens + completionTokens,
+          cachedTokens: Math.max(base.cachedTokens, part.cachedTokens),
+          estimated: false,
+        };
+      }
+    }
+    if (d.tool) recordTool(d.tool);
+  };
+
+  /**
+   * 登记 / 累积一个工具块。
+   *
+   * 下标是「第几个工具块」，只用来给下游分配 tool_calls 的 index；
+   * id 与 name 来自 content_block_start，参数是后续 input_json_delta 一点点拼起来的。
+   */
+  const recordTool = (tool: { index: number; id: string; name: string; args: string }): void => {
+    if (!slots.has(tool.index)) slots.set(tool.index, slots.size);
+    if (tool.id !== '') calls.set(tool.index, { id: tool.id, args: '' });
+    if (tool.name !== '') names.set(tool.index, tool.name);
+    if (tool.args !== '') {
+      const entry = calls.get(tool.index);
+      if (entry) entry.args += tool.args;
+      else calls.set(tool.index, { id: callId(tool), args: tool.args });
+    }
+  };
+
+  if (!opts.stream) {
+    const pump = (async (): Promise<Json> => {
+      for await (const d of iterate()) absorb(d);
+      if (!finished) {
+        finished = true;
+        settle(streamError);
+      }
+      return chatBody();
+    })();
+    return {
+      response: new Response(
+        new ReadableStream<Uint8Array>({
+          async start(c) {
+            c.enqueue(encoder.encode(JSON.stringify(await pump)));
+            c.close();
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } },
+      ),
+      usage,
+    };
+  }
+
+  let sink: ReadableStreamDefaultController<Uint8Array> | null = null;
+  const emit = (choice: Json, extra: Json = {}): void => {
+    if (sink == null) return;
+    sink.enqueue(
+      encoder.encode(
+        `data: ${JSON.stringify({ id: chunkId, object: 'chat.completion.chunk', created, model: opts.model, choices: [{ index: 0, ...choice }], ...extra })}\n\n`,
+      ),
+    );
+  };
+
+  const streamBody = new ReadableStream<Uint8Array>({
+    start(c) {
+      sink = c;
+      emit({ delta: { role: 'assistant', content: '' }, finish_reason: null });
+      void (async () => {
+        try {
+          for await (const d of iterate()) {
+            const toolKnown = d.tool ? slots.has(d.tool.index) : false;
+            const toolSlot = d.tool ? (slots.get(d.tool.index) ?? slots.size) : 0;
+            absorb(d);
+            if (d.text) emit({ delta: { content: d.text }, finish_reason: null });
+            if (d.thinking) emit({ delta: { reasoning_content: d.thinking }, finish_reason: null });
+            if (d.tool) {
+              const known = toolKnown;
+              const slot = toolSlot;
+              if (!known) {
+                emit({
+                  delta: {
+                    tool_calls: [
+                      {
+                        index: slot,
+                        id: callId(d.tool),
+                        type: 'function',
+                        function: { name: d.tool.name, arguments: d.tool.args },
+                      },
+                    ],
+                  },
+                  finish_reason: null,
+                });
+              } else if (d.tool.name !== '') {
+                // content_block_start 里带的 name（少数实现把它推迟到这一帧）
+                emit({
+                  delta: { tool_calls: [{ index: slot, function: { name: d.tool.name } }] },
+                  finish_reason: null,
+                });
+                if (d.tool.args !== '') {
+                  emit({
+                    delta: { tool_calls: [{ index: slot, function: { arguments: d.tool.args } }] },
+                    finish_reason: null,
+                  });
+                }
+              } else if (d.tool.args !== '') {
+                emit({
+                  delta: { tool_calls: [{ index: slot, function: { arguments: d.tool.args } }] },
+                  finish_reason: null,
+                });
+              }
+            }
+          }
+        } catch (err) {
+          streamError = `上游流式响应中断: ${err instanceof Error ? err.message : String(err)}`;
+        } finally {
+          if (!finished) {
+            finished = true;
+            settle(streamError);
+            emit(
+              { delta: {}, finish_reason: streamError ? 'stop' : finishReason() },
+              chatUsage() ? { usage: chatUsage() } : {},
+            );
+            if (sink) {
+              sink.enqueue(encoder.encode('data: [DONE]\n\n'));
+              try {
+                sink.close();
+              } catch {
+                /* 已关闭 */
+              }
+            }
+          }
+        }
+      })();
+    },
+    cancel(reason) {
+      finished = true;
+      settle(`客户端提前断开: ${reason instanceof Error ? reason.message : String(reason ?? '')}`);
+    },
+  });
+
+  if (opts.signal) {
+    opts.signal.addEventListener('abort', () => {
+      finished = true;
+      settle('客户端提前断开');
+    }, { once: true });
+  }
+
+  return {
+    response: new Response(streamBody, {
+      status: 200,
+      headers: {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache',
+        'x-accel-buffering': 'no',
+      },
+    }),
+    usage,
+  };
+}
+
 // ================================================================ 流式翻译
 
 export interface AnthropicStreamOptions {

@@ -13,11 +13,14 @@
 
 import { authenticate, reserveQuota } from '../lib/auth.js';
 import {
+  ANTHROPIC_VERSION,
   anthropicErrorResponse,
   anthropicId,
   anthropicPassthroughUsage,
+  anthropicStreamToChat,
   buildChatRequestFromAnthropic,
   chatStreamToAnthropic,
+  toAnthropicRequest,
   validateMessagesBody,
 } from '../lib/anthropic.js';
 import {
@@ -33,10 +36,13 @@ import { canUseModel, parseAllowedModels } from '../lib/modelAccess.js';
 import {
   buildChatRequest,
   chatStreamToResponses,
+  chatToResponsesRequest,
   extractResponsesUsage,
   responsesId,
+  responsesStreamToChat,
   validateResponsesBody,
 } from '../lib/responses.js';
+import { channelProtocols, protocolMismatch } from '../lib/protocols.js';
 import {
   proxyRequest,
   type ProxyOutcome,
@@ -63,26 +69,12 @@ const RESPONSES_ENDPOINT = '/responses';
 const CHAT_ENDPOINT = '/chat/completions';
 /** 上游原生 Anthropic Messages 端点 */
 const ANTHROPIC_ENDPOINT = '/messages';
+/** 上游无 anthropic-version 声明时的缺省版本（与 Anthropic 官方 SDK 一致） */
+const DEFAULT_ANTHROPIC_VERSION = ANTHROPIC_VERSION;
 
-/**
- * 渠道声明支持哪些协议（channels.capabilities，空格分隔）。
- *
- * 缺省（空串 / NULL）表示「只有 chat」。历史上所有渠道都是这一档，
- * 因此老数据不需要迁移语义，行为与升级前一致。
- */
-export function channelProtocols(channel: ChannelRow): Set<string> {
-  const raw = (channel.capabilities ?? '').trim().toLowerCase();
-  if (raw === '') return new Set(['chat']);
-  const out = new Set<string>();
-  for (const token of raw.split(/[\s,]+/)) {
-    if (token === '') continue;
-    if (token === 'openai-chat') out.add('chat');
-    else if (token === 'openai-responses') out.add('responses');
-    else out.add(token);
-  }
-  if (out.size === 0) out.add('chat');
-  return out;
-}
+// 渠道协议能力解析放在 lib/protocols.ts（渠道路由、后台、翻译层共用同一份归一化规则），
+// 这里重新导出，保持 admin 层的既有引用路径不变
+export { channelProtocols } from '../lib/protocols.js';
 
 export async function handleModels(request: Request, env: Env): Promise<Response> {
   const { ctx: auth } = await authenticate(request, env);
@@ -416,12 +408,19 @@ export async function handleProxy(
     const requestForResponse = isResponses ? { ...body } : null;
 
     const responseId = isResponses ? responsesId('resp') : '';
-    const anthropicVersion = request.headers.get('anthropic-version') || '2023-06-01';
+    const anthropicVersion = request.headers.get('anthropic-version') || DEFAULT_ANTHROPIC_VERSION;
     const route: (ctx: RouteContext) => RouteTarget | null = isResponses
       ? responsesRoute(body, stream === 1)
       : isMessages
         ? messagesRoute(body, stream === 1, anthropicVersion)
         : chatRoute(endpoint);
+
+    /*
+     * capability 只是「排序偏好」：声明了该协议的渠道排到前面先试，其余渠道照样兜底。
+     * 不硬筛是因为渠道的能力标注可能不准（用户手填），而多试一个渠道的代价远小于
+     * 一个本来能成的请求直接 404。
+     */
+    const preferCapability = isResponses ? 'responses' : isMessages ? 'anthropic' : 'chat';
 
     const modelName = model;
     const runProxy = (routeFn?: typeof route): Promise<ProxyOutcome> =>
@@ -430,6 +429,7 @@ export async function handleProxy(
         model: modelName,
         endpoint,
         stream: stream === 1,
+        capability: preferCapability,
         signal: request.signal,
         ...(routeFn ? { route: routeFn } : {}),
       });
@@ -476,6 +476,13 @@ export async function handleProxy(
 
     // 上游打的是 chat 端点 → 需要把结果翻译成下游协议；打的是原生端点 → 原样透传
     const needsTranslation = (isResponses || isMessages) && outcome.endpoint === CHAT_ENDPOINT;
+    /*
+     * 反向降级：下游是纯 chat 端点，但渠道只会原生协议（响应体是 Responses / Messages
+     * 结构）。要让下游拿到 chat.completion，就得在网关里翻回来 —— 否则调用方只能收到
+     * 一串它读不懂的字段，或者干脆被上游 400。
+     */
+    const needsReverse =
+      !isResponses && !isMessages && (outcome.endpoint === RESPONSES_ENDPOINT || outcome.endpoint === ANTHROPIC_ENDPOINT);
     // 注意：不能在这里就取 outcome.response.body —— 非流式原生分支会 clone()，
     // 而 clone() 会重新挂载原响应的内部 body，先前取到的那个流随即变成「已扰动」，
     // 再拿去 new Response() 会抛 TypeError: Response body object should not be disturbed or locked。
@@ -523,6 +530,33 @@ export async function handleProxy(
       const native = anthropicPassthroughUsage(outcome.response, outcome.channel.timeout_ms);
       usagePromise = native.usage;
       responseBody = native.stream;
+    } else if (needsReverse) {
+      // 上游原生 Responses/Messages → 反译成 chat，格式、用量、收尾都由适配层负责
+      const translated =
+        outcome.endpoint === RESPONSES_ENDPOINT
+          ? responsesStreamToChat(outcome.response, {
+              model,
+              stream: stream === 1,
+              idleMs: outcome.channel.timeout_ms,
+              signal: request.signal,
+            })
+          : anthropicStreamToChat(outcome.response, {
+              model,
+              stream: stream === 1,
+              idleMs: outcome.channel.timeout_ms,
+              signal: request.signal,
+            });
+      responseBody = translated.response.body;
+      responseStatus = translated.response.status;
+      /*
+       * 反向降级拿到的用量可能为空（上游没给 usage，且读流时已断）——
+       * 这里补成「估算空用量」，而不是把 null 一路传到结算，否则 settleUsage
+       * 里读 usage.estimated 会直接抛 TypeError，请求变 500。
+       */
+      usagePromise = translated.usage.then((settled) => ({
+        usage: settled.usage ?? emptyUsage(true),
+        error: settled.error,
+      }));
     } else if (isResponses) {
       // 原生非流式：原样透传，但顺带克隆一份解析出来缓存（clone 不消耗原 body）
       const clone = outcome.response.clone();
@@ -548,7 +582,7 @@ export async function handleProxy(
     if (isResponses) {
       headers.set('openai-processing-ms', String(Date.now() - started));
     }
-    if (needsTranslation) {
+    if (needsTranslation || needsReverse) {
       headers.set('content-type', stream === 1 ? 'text/event-stream; charset=utf-8' : 'application/json; charset=utf-8');
       headers.set('cache-control', 'no-cache');
     }
@@ -581,6 +615,8 @@ export async function handleProxy(
   } catch (err) {
     const response = isMessagesRequest ? anthropicErrorResponse(err) : errorResponse(err);
     const status = response.status;
+
+
 
     if (userId != null || keyId != null || model != null) {
       ctx.waitUntil(
@@ -677,9 +713,48 @@ function messagesRoute(
   };
 }
 
-/** 其余端点（chat/completions、embeddings…）一律原样透传，按 Bearer 认证 */
-function chatRoute(endpoint: string): (ctx: RouteContext) => RouteTarget {
-  return (ctx) => ({ endpoint, body: ctx.body, injectUsage: true });
+/**
+ * Chat Completions 端点的渠道路由（普通透传 + 反向降级）。
+ *
+ * 正常情况下原样透传。但同一模型可能只挂在「只吃原生端点」的上游上（文档里很常见：
+ * 某模型只开放 /v1/responses）。这时如果照原样把 chat 请求打过去，上游只会回一句
+ * 「请改用 /v1/responses」——为了一次能跑通，这里按渠道能力把请求改写成它认的协议，
+ * 再把响应反译回 chat。声明了 chat 能力的渠道依旧原样透传，不多做一层转换。
+ *
+ * 所有降级目标都带 failover：上游仍然拒（说的是别的端点/根本不吃这个形态）就换渠道，
+ * 而不是把调用方钉死在一个错误上。
+ */
+function chatRoute(endpoint: string): (ctx: RouteContext) => RouteTarget | null {
+  return (ctx) => {
+    const protocols = channelProtocols(ctx.channel);
+    if (protocols.has('chat')) {
+      return { endpoint, body: ctx.body, injectUsage: true, failover: protocolMismatch };
+    }
+    if (protocols.has('responses')) {
+      const body: Record<string, unknown> = { ...chatToResponsesRequest(ctx.body, ctx.upstreamModel) };
+      if (ctx.stream) body.stream = true;
+      return {
+        endpoint: RESPONSES_ENDPOINT,
+        body,
+        // Responses 原生流在末尾自带 usage；要求上游额外注入反而会被某些实现拒绝
+        injectUsage: false,
+        failover: protocolMismatch,
+      };
+    }
+    if (protocols.has('anthropic')) {
+      const body = toAnthropicRequest(ctx.body, ctx.upstreamModel);
+      if (ctx.stream) body.stream = true;
+      return {
+        endpoint: ANTHROPIC_ENDPOINT,
+        body,
+        injectUsage: false,
+        failover: protocolMismatch,
+        auth: 'x-api-key',
+        headers: { 'anthropic-version': ANTHROPIC_VERSION },
+      };
+    }
+    return null;
+  };
 }
 
 /**

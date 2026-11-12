@@ -31,6 +31,7 @@ import { all, first, getSetting, paginate, run, setSetting } from '../lib/db.js'
 import { ApiError, badRequest, conflict, forbidden, notFound, unauthorized } from '../lib/errors.js';
 import { DAY_MS } from '../lib/maintenance.js';
 import { parseAllowedModels, validateAllowedModels } from '../lib/modelAccess.js';
+import { normalizeCapabilities } from '../lib/protocols.js';
 import { probeModels } from '../lib/upstream.js';
 import {
   fetchChannelBalance,
@@ -493,46 +494,34 @@ async function parseChannelInput(body: Record<string, unknown>): Promise<Channel
  * 「上游协议」下拉框的原值 → capabilities 字符串。
  *
  * 后台新增/编辑渠道时用它把下拉选项落成能力标记；直接调 API 的老写法
- * 仍然可以只传 `capabilities`。
+ * 仍然可以只传 `capabilities`。真正的归一化在 lib/protocols.ts，
+ * 这里只负责把下拉的「组合名」拆成标记。
  */
+const PROTOCOL_PRESETS: Record<string, string> = {
+  chat: '',
+  'openai-chat': '',
+  responses: 'responses',
+  'openai-responses': 'responses',
+  anthropic: 'anthropic',
+  claude: 'anthropic',
+  messages: 'anthropic',
+  'anthropic-chat': 'anthropic chat',
+  'claude-chat': 'anthropic chat',
+  both: 'responses chat',
+  'responses-chat': 'responses chat',
+  all: 'anthropic responses chat',
+  full: 'anthropic responses chat',
+};
+
 function protocolToCapabilities(raw: unknown): string {
   if (typeof raw !== 'string') return '';
-  const t = raw.trim().toLowerCase();
-  if (t === 'responses' || t === 'openai-responses') return 'responses';
-  if (t === 'anthropic' || t === 'claude' || t === 'messages') return 'anthropic';
-  if (t === 'anthropic-chat' || t === 'claude-chat') return 'anthropic chat';
-  if (t === 'both' || t === 'all' || t === 'responses+chat') return 'responses chat';
-  if (t === 'anthropic+responses' || t === 'full') return 'anthropic responses chat';
-  return '';
+  const preset = PROTOCOL_PRESETS[raw.trim().toLowerCase()];
+  return preset === undefined ? '' : preset;
 }
 
-/** 允许的能力标记；未知值直接丢弃，避免脏数据进入调度判断 */
-const KNOWN_CAPABILITIES = new Set(['anthropic', 'responses', 'chat']);
-
-/** 能力标记的固定输出顺序：越靠前越「原生」，方便肉眼比对 */
-const CAPABILITY_ORDER = ['anthropic', 'responses', 'chat'];
-
-/**
- * 归一化渠道能力字段。
- *
- * 接受空格分隔的字符串或字符串数组；只保留已知标记，去重后按固定顺序输出，
- * 让同一种配置永远落成同一个字符串（便于比较与排查）。
- */
+/** 归一化渠道能力字段（委托给 lib/protocols.ts，与调度层共用同一套规则） */
 function parseCapabilities(raw: unknown): string {
-  const tokens: string[] = [];
-  if (typeof raw === 'string') tokens.push(...raw.split(/[\s,]+/));
-  else if (Array.isArray(raw)) {
-    for (const item of raw) if (typeof item === 'string') tokens.push(...item.split(/[\s,]+/));
-  }
-  const kept = new Set<string>();
-  for (const token of tokens) {
-    const t = token.trim().toLowerCase();
-    if (KNOWN_CAPABILITIES.has(t)) kept.add(t);
-    else if (t === 'openai-responses') kept.add('responses');
-    else if (t === 'openai-chat') kept.add('chat');
-    else if (t === 'claude' || t === 'messages' || t === 'anthropic-messages') kept.add('anthropic');
-  }
-  return CAPABILITY_ORDER.filter((t) => kept.has(t)).join(' ');
+  return normalizeCapabilities(raw);
 }
 
 /**

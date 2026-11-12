@@ -53,6 +53,7 @@
 - **OpenAI 兼容**：`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/moderations`、`/v1/models`，客户端只需改 `base_url`
 - **Responses API**：`/v1/responses`（含 `stream` 事件流、`GET /v1/responses/:id`、`previous_response_id`）。渠道原生支持就直接透传，否则网关自动在 chat 协议上翻译，老渠道无需改动
 - **Claude / Anthropic 协议**：`/v1/messages`（含 `stream` 事件流与 `/v1/messages/count_tokens`）。渠道原生支持就透传（自动改用 `x-api-key` + `anthropic-version` 认证），否则翻译到 chat 协议再合成 Anthropic 事件流 —— Claude Code、Cline、Anthropic SDK 改个 `base_url` 就能接入
+- **协议自动选路 + 双向翻译**：同一个模型挂在「只会 Responses」「只会 Messages」「只会 chat」的多个上游上时，网关按下游端点自动挑能力匹配的渠道先试；被迫跨协议时两个方向都翻（chat 请求 → 原生上游也能跑，原生响应 → chat.completion 回给客户端）。上游回「请改用 /v1/xxx」时自动换渠道重试，最终报错里列出每个被跳过的渠道及原因
 - **多上游 + 25 家预设**：一个适配器覆盖所有 OpenAI 兼容平台，填地址和 Key 就能用
 - **调度与容灾**：优先级 + 加权随机；失败自动换渠道；上游鉴权失效 / 欠费 / 限流按响应体识别并冷却；连续失败熔断
 - **精确计费**：优先用上游 `usage`，流式自动注入 `include_usage`；缺失时按字符估算并标记；缓存命中单独计价

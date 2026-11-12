@@ -256,7 +256,7 @@ describe('chatStreamToAnthropic 流式', () => {
   test('空响应体不抛，返回空流', async () => {
     const result = chatStreamToAnthropic(new Response(null), base);
     expect(result.response.status).toBe(200);
-    await expect(new Response(result.response.body).text()).resolves.toBe('');
+    expect(await new Response(result.response.body).text()).toBe('');
   });
 
   test('非流式下游 + 上游返回整包 chat JSON 也能折叠（不是 SSE）', async () => {

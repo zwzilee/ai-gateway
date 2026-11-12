@@ -791,6 +791,695 @@ export function chatStreamToResponses(upstream: Response, opts: ResponsesStreamO
   return { response: new Response(streamBody, { status: 200, headers }), usage, payload };
 }
 
+// ================================================================ Responses → Chat（反向降级）
+
+/**
+ * 原生 Responses 响应（整包）→ Chat Completions 响应。
+ *
+ * 用来满足「下游用 chat 协议，但同一模型只挂在只吃 /responses 的上游」。方向与
+ * chatToResponse 相反，信息按协议能表达的尽量保留：reasoning → reasoning_content、
+ * refusal → content 文本、function_call → tool_calls、incomplete → finish_reason=length。
+ * 拿不到 usage 时保留 null，由结算层按估算兜底（与原生透传一致）。
+ */
+export function responsesToChat(response: Json, model: string): Json {
+  const output = Array.isArray(response.output) ? response.output : [];
+  let text = '';
+  let reasoning = '';
+  const toolCalls: Json[] = [];
+
+  for (const raw of output) {
+    if (!isObject(raw)) continue;
+    const type = str(raw.type);
+    if (type === 'reasoning') {
+      const summary = Array.isArray(raw.summary) ? raw.summary : [];
+      for (const part of summary) if (isObject(part) && typeof part.text === 'string') reasoning += part.text;
+      continue;
+    }
+    if (type === 'message') {
+      const content = Array.isArray(raw.content) ? raw.content : [];
+      for (const part of content) {
+        if (!isObject(part)) continue;
+        if (str(part.type) === 'refusal') text += str(part.refusal);
+        else text += str(part.text);
+      }
+      continue;
+    }
+    if (type === 'function_call') {
+      toolCalls.push({
+        id: str(raw.call_id) || str(raw.id) || responsesId('call'),
+        type: 'function',
+        function: {
+          name: str(raw.name),
+          arguments:
+            typeof raw.arguments === 'string' ? raw.arguments : stringify(raw.arguments ?? {}),
+        },
+      });
+    }
+  }
+
+  const message: Json = { role: 'assistant', content: toolCalls.length > 0 && text === '' ? null : text };
+  if (reasoning !== '') message.reasoning_content = reasoning;
+  if (toolCalls.length > 0) message.tool_calls = toolCalls;
+
+  const status = str(response.status);
+  const finishReason = toolCalls.length > 0 ? 'tool_calls' : status === 'incomplete' ? 'length' : 'stop';
+  const usage = isObject(response.usage)
+    ? {
+        prompt_tokens: num(response.usage.input_tokens) ?? 0,
+        completion_tokens: num(response.usage.output_tokens) ?? 0,
+        total_tokens:
+          num(response.usage.total_tokens) ??
+          (num(response.usage.input_tokens) ?? 0) + (num(response.usage.output_tokens) ?? 0),
+      }
+    : null;
+
+  return {
+    id: str(response.id).startsWith('chatcmpl') ? str(response.id) : `chatcmpl-${str(response.id) || responsesId('chat')}`,
+    object: 'chat.completion',
+    created: num(response.created_at) ?? Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message, finish_reason: finishReason, logprobs: null }],
+    usage,
+  };
+}
+
+/** SSE 帧 → 事件对象；不是 data 行就返回 null */
+function readSseFrame(line: string): Json | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('data:')) return null;
+  const data = trimmed.slice(5).trim();
+  if (data === '' || data === '[DONE]') return null;
+  try {
+    const parsed = JSON.parse(data) as Json;
+    return isObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 原生 Responses 流 → Chat Completions 流（SSE）。
+ *
+ * 事件都是「增量」的：output_text.delta → content、reasoning_summary_text.delta /
+ * reasoning_text.delta → reasoning_content、function_call_arguments.delta → tool_calls
+ * 的 arguments 分片。收尾时把 terminal 事件里的 response 对象补成最后一条 useage 帧
+ * 与 [DONE]。
+ *
+ * 与 chatStreamToResponses 一样按单一状态机写，非流式下游也用它：读完折叠成一包。
+ */
+export interface ResponsesToChatOptions {
+  model: string;
+  /** 下游要 SSE 还是整包 JSON */
+  stream: boolean;
+  /** 上游 SSE 空闲上限，沿用渠道 timeout_ms 的「数据间隔」语义 */
+  idleMs: number;
+  signal?: AbortSignal;
+}
+
+/**
+ * Chat Completions 请求 → Responses 请求（反向降级：下游 chat、上游只有 /responses）。
+ *
+ * 只搬协议能一一对应的字段：messages 里的 assistant tool_calls → function_call 项、
+ * tool 消息 → function_call_output 项、system/developer → instructions、max_tokens →
+ * max_output_tokens、stop → 不传（Responses 没有等价的通用停止序列）、tools 走同一套
+ * function 结构。多模态图片沿用 Responses 的 input_image 结构。
+ */
+export function chatToResponsesRequest(body: Json, upstreamModel: string): Json {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const systemParts: string[] = [];
+  const input: Json[] = [];
+
+  for (const raw of messages) {
+    if (!isObject(raw)) continue;
+    const role = str(raw.role) || 'user';
+    if (role === 'system' || role === 'developer') {
+      const text = contentToText(raw.content);
+      if (text !== '') systemParts.push(text);
+      continue;
+    }
+    if (role === 'tool') {
+      const output = contentToText(raw.content);
+      input.push({
+        type: 'function_call_output',
+        call_id: str(raw.tool_call_id) || responsesId('call'),
+        output,
+      });
+      continue;
+    }
+    if (role === 'assistant') {
+      const toolCalls = Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
+      const text = contentToText(raw.content);
+      if (text !== '' || toolCalls.length === 0) {
+        input.push({ type: 'message', role: 'assistant', content: responseContent(raw.content) });
+      }
+      for (const call of toolCalls) {
+        if (!isObject(call)) continue;
+        const fn = isObject(call.function) ? call.function : {};
+        input.push({
+          type: 'function_call',
+          call_id: str(call.id) || responsesId('call'),
+          name: str(fn.name),
+          arguments: typeof fn.arguments === 'string' ? fn.arguments : stringify(fn.arguments ?? {}),
+        });
+      }
+      continue;
+    }
+    input.push({ type: 'message', role, content: responseContent(raw.content) });
+  }
+
+  const out: Json = { model: upstreamModel, input };
+  if (systemParts.length > 0) out.instructions = systemParts.join('\n\n');
+
+  const maxTokens = num(body.max_tokens) ?? num(body.max_completion_tokens);
+  if (maxTokens !== undefined && maxTokens > 0) out.max_output_tokens = maxTokens;
+  const temperature = num(body.temperature);
+  if (temperature !== undefined) out.temperature = temperature;
+  const topP = num(body.top_p);
+  if (topP !== undefined) out.top_p = topP;
+  if (typeof body.user === 'string' && body.user !== '') out.user = body.user;
+
+  const tools = body.tools;
+  if (Array.isArray(tools)) {
+    const converted = tools
+      .filter((t): t is Json => isObject(t) && str(t.type) === 'function')
+      .map((t) => {
+        const fn = isObject(t.function) ? t.function : {};
+        const tool: Json = { type: 'function', name: str(fn.name) };
+        if (str(fn.description) !== '') tool.description = str(fn.description);
+        if (isObject(fn.parameters)) tool.parameters = fn.parameters;
+        return tool;
+      });
+    if (converted.length > 0) {
+      out.tools = converted;
+      const choice = body.tool_choice;
+      if (typeof choice === 'string') out.tool_choice = choice;
+      else if (isObject(choice) && isObject(choice.function)) {
+        out.tool_choice = { type: 'function', name: str(choice.function.name) };
+      }
+    }
+  }
+  if (body.parallel_tool_calls === false && Array.isArray(out.tools)) {
+    out.parallel_tool_calls = false;
+  }
+
+  const format = isObject(body.response_format) ? body.response_format : null;
+  if (format) {
+    const type = str(format.type);
+    if (type === 'json_object') out.text = { format: { type: 'json_object' } };
+    else if (type === 'json_schema' && isObject(format.json_schema)) {
+      out.text = { format: { type: 'json_schema', ...format.json_schema } };
+    }
+  }
+
+  return out;
+}
+
+/** chat 的 content（字符串或分块数组）→ 纯文本 */
+function contentToText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  let text = '';
+  for (const part of content) {
+    if (typeof part === 'string') text += part;
+    else if (isObject(part) && typeof part.text === 'string') text += part.text;
+  }
+  return text;
+}
+
+/** chat 的 content → Responses 的 input 内容（纯文本压成字符串，含图片才保留数组） */
+function responseContent(content: unknown): unknown {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return contentToText(content);
+  const out: Json[] = [];
+  let onlyText = true;
+  for (const part of content) {
+    if (typeof part === 'string') {
+      out.push({ type: 'input_text', text: part });
+      continue;
+    }
+    if (!isObject(part)) continue;
+    if (str(part.type) === 'text') out.push({ type: 'input_text', text: str(part.text) });
+    else if (str(part.type) === 'image_url') {
+      onlyText = false;
+      const image = isObject(part.image_url) ? part.image_url : {};
+      out.push({ type: 'input_image', image_url: str(image.url) });
+    } else out.push(part);
+  }
+  if (out.length === 0) return '';
+  return onlyText ? contentToText(content) : out;
+}
+
+/** responsesStreamToChat 的产出：响应本身 + 异步结算的用量 */
+export interface ResponsesToChatResult {
+  response: Response;
+  usage: Promise<{ usage: TokenUsage | null; error: string | null }>;
+}
+
+/** 一个正在累积的 Chat delta */
+interface ChatDelta {
+  content?: string;
+  reasoning?: string;
+  tool?: { index: number; id: string; name: string; args: string };
+  error?: string;
+  /** 事件流里明确报错 = 上游已经把这次生成结束掉了，不必再等收尾事件 */
+  isError?: boolean;
+  /** terminal 事件里的整包 response（取 status/usage/error） */
+  final?: Json;
+}
+
+/**
+ * 原生 Responses 流 → 逐条 Chat delta。
+ *
+ * 用 async generator 读：流式时边读边发（下游不必等整包），非流式时读完再折叠。
+ * 生成器结束时必定调用一次 onEnd —— 正常收尾传 null，异常/看门狗/客户端断开传原因。
+ *
+ * 两种上游都吃：真 SSE（含 event: 行）与整包 JSON（某些代理层会把流压成 JSON）。
+ */
+async function* responsesReader(
+  upstream: Response,
+  opts: { idleMs: number; signal?: AbortSignal },
+  onEnd: (error: string | null) => void,
+): AsyncGenerator<ChatDelta, void, undefined> {
+  let finished = false;
+  const done = (error: string | null): void => {
+    if (finished) return;
+    finished = true;
+    onEnd(error);
+  };
+
+  const body = upstream.body;
+  if (!body) {
+    done('上游返回了空响应体');
+    return;
+  }
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let buffer = '';
+  let whole = '';
+  let sawSse = false;
+
+  const onAbort = (): void => {
+    void reader.cancel().catch(() => undefined);
+  };
+  opts.signal?.addEventListener('abort', onAbort, { once: true });
+
+  try {
+    for (;;) {
+      idleTimer = setTimeout(onAbort, opts.idleMs);
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await reader.read();
+      } catch (err) {
+        done(`上游流式响应中断: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      } finally {
+        if (idleTimer !== undefined) {
+          clearTimeout(idleTimer);
+          idleTimer = undefined;
+        }
+      }
+      if (chunk.done) break;
+      const piece = decoder.decode(chunk.value, { stream: true });
+      whole += piece;
+      buffer += piece.replace(/\r\n/g, '\n');
+      let nl: number;
+      while ((nl = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        sawSse = true;
+        const event = readSseFrame(line);
+        if (!event) continue;
+        for (const d of mapResponseEvent(event)) {
+          yield d;
+          if (d.isError) {
+            done(null);
+            return;
+          }
+        }
+      }
+    }
+
+    // 整包 JSON（没有 SSE 行）：按 response 对象处理
+    if (!sawSse && whole.trim().startsWith('{')) {
+      let parsed: Json = {};
+      try {
+        parsed = JSON.parse(whole.trim()) as Json;
+      } catch {
+        parsed = {};
+      }
+      /*
+       * 整包也要先拆成增量（文本/思考/工具），不能只 yield 一个 final ——
+       * 那样下游只会收到一个空的 finish_reason 帧，正文全丢。
+       */
+      for (const d of wholeResponse(parsed)) {
+        yield d;
+        if (d.isError) {
+          done(null);
+          return;
+        }
+      }
+      done(null);
+      return;
+    }
+    if (buffer.startsWith('data:')) {
+      const event = readSseFrame(buffer);
+      if (event) for (const d of mapResponseEvent(event)) yield d;
+    }
+    done(null);
+  } finally {
+    opts.signal?.removeEventListener('abort', onAbort);
+    if (idleTimer !== undefined) {
+      clearTimeout(idleTimer);
+      idleTimer = undefined;
+    }
+    void reader.cancel().catch(() => undefined);
+  }
+}
+
+/** Responses 的 message.content（output_text / refusal 块）→ 纯文本 */
+function outputText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  let text = '';
+  for (const part of content) {
+    if (!isObject(part)) continue;
+    const kind = str(part.type);
+    if (kind === 'output_text' || kind === 'text' || kind === 'refusal') text += str(part.text);
+  }
+  return text;
+}
+
+/**
+ * 整包 Response 对象 → 一串增量（文本 / 思考 / 工具 + 收尾）。
+ *
+ * 非流式降级时上游会直接回一个完整的 Response；此时没有 delta 可转发，
+ * 但下游可能开着 stream，所以仍然拆成增量喂给同一个吸收器。
+ */
+function wholeResponse(response: Json): ChatDelta[] {
+  const out: ChatDelta[] = [];
+  let index = 0;
+  for (const item of Array.isArray(response.output) ? response.output : []) {
+    if (!isObject(item)) continue;
+    const kind = str(item.type);
+    if (kind === 'reasoning') {
+      const text = (Array.isArray(item.summary) ? item.summary : [])
+        .map((part) => (isObject(part) ? str(part.text) : ''))
+        .join('');
+      if (text !== '') out.push({ reasoning: text });
+    } else if (kind === 'message') {
+      const text = outputText(item.content);
+      if (text !== '') out.push({ content: text });
+    } else if (kind === 'function_call') {
+      out.push({
+        tool: {
+          index: index++,
+          id: str(item.call_id) || str(item.id),
+          name: str(item.name),
+          args: typeof item.arguments === 'string' ? item.arguments : stringify(item.arguments ?? {}),
+        },
+      });
+    }
+  }
+  out.push({ final: response });
+  return out;
+}
+
+export function mapResponseEvent(event: Json): ChatDelta[] {
+  const type = str(event.type);
+  /*
+   * 两种现实存在的形状：正版平铺（{type, delta, output_index…}），以及被某些
+   * 中间层包了一层的 {response: {...}}（连 type 都没有，只能从 response.status 认结尾）。
+   * 不认第二种，非 OpenAI 上游的整包结尾会全部丢掉、用量退回估算。
+   */
+  if (type === '' && isObject(event.response)) {
+    const response = event.response;
+    const status = str(response.status);
+    if (status === 'completed' || status === 'incomplete' || status === 'failed') {
+      return [{ final: response }];
+    }
+    return [];
+  }
+  if (type === '' && isObject(event.object) && str(event.object) === 'response') {
+    return wholeResponse(event);
+  }
+  /*
+   * 整包 Response 对象（非流式、或被中间层压成一条 JSON）。没有 type、也可能没有
+   * object 字段 —— 这时只能靠「有 output 数组或 status 字段」来认。
+   */
+  if (type === '' && (Array.isArray(event.output) || str(event.status) !== '')) {
+    return wholeResponse(event);
+  }
+  if (type === 'response.output_text.delta') {
+    const piece = str(event.delta);
+    return piece === '' ? [] : [{ content: piece }];
+  }
+  if (type === 'response.reasoning_summary_text.delta' || type === 'response.reasoning_text.delta') {
+    const piece = str(event.delta);
+    return piece === '' ? [] : [{ reasoning: piece }];
+  }
+  if (type === 'response.output_item.added' && isObject(event.item)) {
+    const item = event.item;
+    if (str(item.type) === 'function_call') {
+      const index = num(event.output_index) ?? 0;
+      return [
+        {
+          tool: {
+            index,
+            id: str(item.call_id) || str(item.id),
+            name: str(item.name),
+            args: typeof item.arguments === 'string' ? item.arguments : '',
+          },
+        },
+      ];
+    }
+    return [];
+  }
+  if (type === 'response.function_call_arguments.delta') {
+    const piece = str(event.delta);
+    if (piece === '') return [];
+    const index = num(event.output_index) ?? 0;
+    return [{ tool: { index, id: str(event.item_id), name: '', args: piece } }];
+  }
+  if (type === 'response.completed' || type === 'response.incomplete' || type === 'response.failed') {
+    const response = isObject(event.response) ? event.response : {};
+    return [{ final: response }];
+  }
+  if (type === 'error') {
+    return [{ error: str(event.message) || '上游在流中返回错误', isError: true }];
+  }
+  return [];
+}
+
+export function responsesStreamToChat(
+  upstream: Response,
+  opts: ResponsesToChatOptions,
+): ResponsesToChatResult {
+  let settled = false;
+  let resolveUsage!: (v: { usage: TokenUsage | null; error: string | null }) => void;
+  const usage = new Promise<{ usage: TokenUsage | null; error: string | null }>((resolve) => {
+    resolveUsage = resolve;
+  });
+
+  const encoder = new TextEncoder();
+  const chunkId = `chatcmpl-${responsesId('chat')}`;
+  const created = Math.floor(Date.now() / 1000);
+  const slots = new Map<number, number>();
+  // 上游给的工具调用 id（Responses 的 call_id / item id），没有就自己编一个
+  const names = new Map<number, string>();
+  const calls = new Map<number, { id: string; args: string }>();
+  const callId = (d: ChatDelta): string =>
+    d.tool && d.tool.id !== '' ? d.tool.id : `${chunkId}-call-${d.tool?.index ?? 0}`;
+  let content = '';
+  let reasoning = '';
+  let finishReason = 'stop';
+  let finalUsage: TokenUsage | null = null;
+  let streamError: string | null = null;
+
+  const settle = (error: string | null): void => {
+    if (settled) return;
+    settled = true;
+    resolveUsage({ usage: finalUsage, error: error ?? streamError });
+  };
+
+  const chatUsage = (): Json | null =>
+    finalUsage
+      ? {
+          prompt_tokens: finalUsage.promptTokens,
+          completion_tokens: finalUsage.completionTokens,
+          total_tokens: finalUsage.totalTokens,
+        }
+      : null;
+
+  const message = (): Json => {
+    const msg: Json = { role: 'assistant', content: slots.size > 0 && content === '' ? null : content };
+    if (reasoning !== '') msg.reasoning_content = reasoning;
+    if (slots.size > 0) {
+      msg.tool_calls = [...slots.entries()]
+        .sort((a, b) => a[1] - b[1])
+        .map(([outputIndex]) => {
+          const entry = calls.get(outputIndex);
+          return {
+            id: entry?.id ?? `${chunkId}-call-${outputIndex}`,
+            type: 'function',
+            function: { name: names.get(outputIndex) ?? '', arguments: entry?.args ?? '' },
+          };
+        });
+    }
+    return msg;
+  };
+
+  const chatBody = (): Json => ({
+    id: chunkId,
+    object: 'chat.completion',
+    created,
+    model: opts.model,
+    choices: [{ index: 0, message: message(), finish_reason: streamError ? 'stop' : finishReason, logprobs: null }],
+    usage: chatUsage(),
+  });
+
+  const applyFinal = (response: Json): void => {
+    const status = str(response.status);
+    if (status === 'incomplete') finishReason = 'length';
+    if (slots.size > 0) finishReason = 'tool_calls';
+    if (isObject(response.error)) streamError = str((response.error as Json).message) || streamError;
+    finalUsage = extractResponsesUsage(response.usage) ?? finalUsage;
+  };
+
+  /** 吃一条 delta：累积状态，同时（流式时）发帧 */
+  const absorb = (d: ChatDelta, emitFrame: boolean): void => {
+    if (d.error) {
+      streamError = d.error;
+      return;
+    }
+    if (d.content) {
+      content += d.content;
+      if (emitFrame) emit({ delta: { content: d.content }, finish_reason: null });
+    }
+    if (d.reasoning) {
+      reasoning += d.reasoning;
+      if (emitFrame) emit({ delta: { reasoning_content: d.reasoning }, finish_reason: null });
+    }
+    if (d.tool) {
+      finishReason = 'tool_calls';
+      if (d.tool.name !== '') names.set(d.tool.index, d.tool.name);
+      let slot = slots.get(d.tool.index);
+      if (slot === undefined) {
+        slot = slots.size;
+        slots.set(d.tool.index, slot);
+        calls.set(d.tool.index, { id: callId(d), args: d.tool.args });
+        if (emitFrame) {
+          emit({
+            delta: {
+              tool_calls: [
+                {
+                  index: slot,
+                  id: callId(d),
+                  type: 'function',
+                  function: { name: d.tool.name, arguments: d.tool.args },
+                },
+              ],
+            },
+            finish_reason: null,
+          });
+        }
+        // 整包路径一次就把参数带全了，别重复发
+        if (d.tool.args === '') return;
+      } else {
+        const entry = calls.get(d.tool.index);
+        if (entry) entry.args += d.tool.args;
+      }
+      if (emitFrame && d.tool.args !== '') {
+        emit({ delta: { tool_calls: [{ index: slot, function: { arguments: d.tool.args } }] }, finish_reason: null });
+      }
+    }
+    if (d.final) applyFinal(d.final);
+  };
+
+  let sink: ReadableStreamDefaultController<Uint8Array> | null = null;
+  const emit = (choice: Json, extra: Json = {}): void => {
+    if (sink == null) return;
+    sink.enqueue(
+      encoder.encode(
+        `data: ${JSON.stringify({ id: chunkId, object: 'chat.completion.chunk', created, model: opts.model, choices: [{ index: 0, ...choice }], ...extra })}\n\n`,
+      ),
+    );
+  };
+
+  /** 收尾：结算用量，流式时补 finish_reason 帧与 [DONE] */
+  const close = (error: string | null): void => {
+    settle(error);
+    if (sink == null) return;
+    emit(
+      { delta: {}, finish_reason: streamError ? 'stop' : finishReason },
+      chatUsage() ? { usage: chatUsage() } : {},
+    );
+    sink.enqueue(encoder.encode('data: [DONE]\n\n'));
+    try {
+      sink.close();
+    } catch {
+      /* 已关闭 */
+    }
+  };
+
+  if (!opts.stream) {
+    // 非流式：读完折叠成一包。读失败不抛给调用方 —— 已经拿到上游 200 的前提下，
+    // 给一个空内容 + finish_reason=stop 比 500 更不伤调用方（用量按估算结算并记 error）
+    const pump = (async (): Promise<Json> => {
+      try {
+        for await (const d of responsesReader(upstream, opts, () => undefined)) absorb(d, false);
+      } catch (err) {
+        streamError = `上游流式响应中断: ${err instanceof Error ? err.message : String(err)}`;
+      }
+      settle(streamError);
+      return chatBody();
+    })();
+    return {
+      response: new Response(
+        new ReadableStream<Uint8Array>({
+          async start(c) {
+            c.enqueue(encoder.encode(JSON.stringify(await pump)));
+            c.close();
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } },
+      ),
+      usage,
+    };
+  }
+
+  const body = new ReadableStream<Uint8Array>({
+    start(c) {
+      sink = c;
+      emit({ delta: { role: 'assistant', content: '' }, finish_reason: null });
+      void (async () => {
+        try {
+          for await (const d of responsesReader(upstream, opts, () => undefined)) absorb(d, true);
+          close(null);
+        } catch (err) {
+          close(`上游流式响应中断: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      })();
+    },
+    cancel(reason) {
+      settle(`客户端提前断开: ${reason instanceof Error ? reason.message : String(reason ?? '')}`);
+    },
+  });
+
+  return {
+    response: new Response(body, {
+      status: 200,
+      headers: {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache',
+        'x-accel-buffering': 'no',
+      },
+    }),
+    usage,
+  };
+}
+
 // ================================================================ 入口校验
 
 /** Responses 的必填项：model（在 handleProxy 里查）+ input 或 previous_response_id */
