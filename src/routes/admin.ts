@@ -481,10 +481,26 @@ async function parseChannelInput(body: Record<string, unknown>): Promise<Channel
     timeout_ms: asNumber(body.timeout_ms, 'timeout_ms', { min: 1000, max: 600_000, fallback: 120_000 }),
     extra_headers: asJsonObjectString(body.extra_headers, 'extra_headers'),
     inject_usage: asBool(body.inject_usage, true) ? 1 : 0,
-    capabilities: parseCapabilities(body.capabilities),
+    capabilities: parseCapabilities(
+      body.capabilities !== undefined ? body.capabilities : protocolToCapabilities(body.protocol),
+    ),
     models: asModelMapping(body.models),
     register_models: asBool(body.register_models, false) ? 1 : 0,
   };
+}
+
+/**
+ * 「上游协议」下拉框的原值 → capabilities 字符串。
+ *
+ * 后台新增/编辑渠道时用它把三选一（chat / responses / both）落成能力标记；
+ * 直接调 API 的老写法仍然可以只传 `capabilities`。
+ */
+function protocolToCapabilities(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  const t = raw.trim().toLowerCase();
+  if (t === 'responses' || t === 'openai-responses') return 'responses';
+  if (t === 'both' || t === 'all' || t === 'responses+chat') return 'responses chat';
+  return '';
 }
 
 /** 允许的能力标记；未知值直接丢弃，避免脏数据进入调度判断 */
