@@ -409,6 +409,13 @@ interface ChannelInput {
   timeout_ms: number;
   extra_headers: string;
   inject_usage: number;
+  /**
+   * 上游支持的协议能力，空格分隔。
+   *
+   * 目前只区分 `/v1/responses` 能不能原生透传：写了 `responses` 就走原生，
+   * 否则网关内翻译成 chat 协议。空串是默认值（只有 chat），与老渠道一致。
+   */
+  capabilities: string;
   models: Record<string, string>;
   /** 保存时把映射里尚未登记的下游模型自动写入 models 表（单价先为 0） */
   register_models: number;
@@ -474,9 +481,35 @@ async function parseChannelInput(body: Record<string, unknown>): Promise<Channel
     timeout_ms: asNumber(body.timeout_ms, 'timeout_ms', { min: 1000, max: 600_000, fallback: 120_000 }),
     extra_headers: asJsonObjectString(body.extra_headers, 'extra_headers'),
     inject_usage: asBool(body.inject_usage, true) ? 1 : 0,
+    capabilities: parseCapabilities(body.capabilities),
     models: asModelMapping(body.models),
     register_models: asBool(body.register_models, false) ? 1 : 0,
   };
+}
+
+/** 允许的能力标记；未知值直接丢弃，避免脏数据进入调度判断 */
+const KNOWN_CAPABILITIES = new Set(['responses', 'chat']);
+
+/**
+ * 归一化渠道能力字段。
+ *
+ * 接受空格分隔的字符串或字符串数组；只保留已知标记，去重后按固定顺序输出，
+ * 让同一种配置永远落成同一个字符串（便于比较与排查）。
+ */
+function parseCapabilities(raw: unknown): string {
+  const tokens: string[] = [];
+  if (typeof raw === 'string') tokens.push(...raw.split(/[\s,]+/));
+  else if (Array.isArray(raw)) {
+    for (const item of raw) if (typeof item === 'string') tokens.push(...item.split(/[\s,]+/));
+  }
+  const kept = new Set<string>();
+  for (const token of tokens) {
+    const t = token.trim().toLowerCase();
+    if (KNOWN_CAPABILITIES.has(t)) kept.add(t);
+    else if (t === 'openai-responses') kept.add('responses');
+    else if (t === 'openai-chat') kept.add('chat');
+  }
+  return ['responses', 'chat'].filter((t) => kept.has(t)).join(' ');
 }
 
 /**
@@ -562,6 +595,7 @@ adminApi.get('/channels', async (c) => {
       timeout_ms: row.timeout_ms,
       extra_headers: row.extra_headers,
       inject_usage: row.inject_usage === 1,
+      capabilities: row.capabilities ?? '',
       cooldown_until: row.cooldown_until,
       fail_count: row.fail_count,
       last_error: row.last_error,
@@ -594,8 +628,8 @@ adminApi.post('/channels', async (c) => {
   const result = await env.DB.prepare(
     `INSERT INTO channels
        (name, base_url, api_key_enc, status, priority, weight, allow_all_models, allow_insecure_http,
-        timeout_ms, extra_headers, inject_usage, cooldown_until, fail_count, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,?,?)`,
+        timeout_ms, extra_headers, inject_usage, capabilities, cooldown_until, fail_count, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?)`,
   )
     .bind(
       input.name,
@@ -609,6 +643,7 @@ adminApi.post('/channels', async (c) => {
       input.timeout_ms,
       input.extra_headers,
       input.inject_usage,
+      input.capabilities,
       now,
       now,
     )
@@ -638,7 +673,7 @@ adminApi.put('/channels/:id', async (c) => {
   await env.DB.prepare(
     `UPDATE channels SET name = ?, base_url = ?, api_key_enc = ?, status = ?, priority = ?,
             weight = ?, allow_all_models = ?, allow_insecure_http = ?, timeout_ms = ?, extra_headers = ?, inject_usage = ?,
-            fail_count = 0, cooldown_until = 0, updated_at = ?
+            capabilities = ?, fail_count = 0, cooldown_until = 0, updated_at = ?
       WHERE id = ?`,
   )
     .bind(
@@ -653,6 +688,7 @@ adminApi.put('/channels/:id', async (c) => {
       input.timeout_ms,
       input.extra_headers,
       input.inject_usage,
+      input.capabilities,
       Date.now(),
       id,
     )

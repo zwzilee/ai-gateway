@@ -545,6 +545,34 @@ export interface ProxyOptions {
   endpoint: string;
   stream: boolean;
   signal?: AbortSignal;
+  /**
+   * 上游端点解析器：返回实际要打的路径与对应的请求体。
+   *
+   * 用于「同一协议有两种打法的上游」（例如 /v1/responses 原生透传，或降级成
+   * /chat/completions 再翻译）。返回 null 表示该渠道用不了这次请求 —— 常见的
+   * 是上游没有 responses 端点（404），此时直接换下一个渠道，不被计成渠道故障。
+   */
+  route?: (ctx: RouteContext) => RouteTarget | null;
+}
+
+export interface RouteContext {
+  channel: ChannelRow;
+  /** 下游请求的模型名 */
+  model: string;
+  /** 该渠道映射到的上游模型名 */
+  upstreamModel: string;
+  endpoint: string;
+  stream: boolean;
+  body: Record<string, unknown>;
+}
+
+export interface RouteTarget {
+  endpoint: string;
+  body: Record<string, unknown>;
+  /** 是否要求上游在流式响应里带 usage（chat 协议需要显式 stream_options） */
+  injectUsage?: boolean;
+  /** 上游没有该端点（404/405）时静默换渠道，不记渠道故障 */
+  fallbackOnMissingEndpoint?: boolean;
 }
 
 export interface ProxyOutcome {
@@ -554,6 +582,8 @@ export interface ProxyOutcome {
   channel: ChannelRow;
   upstreamModel: string;
   attempts: number;
+  /** 实际打到的上游端点（翻译层据此判断要不要反向转换） */
+  endpoint: string;
 }
 
 export async function proxyRequest(env: Env, opts: ProxyOptions): Promise<ProxyOutcome> {
@@ -564,7 +594,7 @@ export async function proxyRequest(env: Env, opts: ProxyOptions): Promise<ProxyO
 
   const errors: string[] = [];
   let attempts = 0;
-  // 失败切换时同一份请求体不必反复序列化。键只取「上游模型名 + 是否注入 usage」，
+  // 失败切换时同一份请求体不必反复序列化。键只取「端点 + 上游模型名 + 是否注入 usage」，
   // 其余字段都来自不可变的 opts.body
   const bodyCache = new Map<string, string>();
 
@@ -601,14 +631,28 @@ async function attemptChannel(
   opts: ProxyOptions,
   bodyCache: Map<string, string>,
 ): Promise<Omit<ProxyOutcome, 'channel' | 'upstreamModel' | 'attempts'> | null> {
-  const url = buildUpstreamUrl(channel.base_url, opts.endpoint);
+  // 端点与请求体由调用方（或路由解析器）决定：/v1/responses 在支持它的渠道上原样转发，
+  // 在不支持的渠道上降级成 /v1/chat/completions 的请求体，响应由调用方再翻译回去。
+  const target: RouteTarget | null = opts.route
+    ? opts.route({
+        channel,
+        model: opts.model,
+        upstreamModel,
+        endpoint: opts.endpoint,
+        stream: opts.stream,
+        body: opts.body,
+      })
+    : { endpoint: opts.endpoint, body: opts.body };
+  if (!target) return null;
+
+  const url = buildUpstreamUrl(channel.base_url, target.endpoint);
   const headers = await buildUpstreamHeaders(channel, env);
 
-  const injectUsage = opts.stream && channel.inject_usage === 1;
-  const cacheKey = `${upstreamModel}\u0000${injectUsage ? 1 : 0}`;
+  const injectUsage = (target.injectUsage ?? true) && opts.stream && channel.inject_usage === 1;
+  const cacheKey = `${target.endpoint}\u0000${upstreamModel}\u0000${injectUsage ? 1 : 0}`;
   let payload = bodyCache.get(cacheKey);
   if (payload === undefined) {
-    const body: Record<string, unknown> = { ...opts.body, model: upstreamModel };
+    const body: Record<string, unknown> = { ...target.body, model: upstreamModel };
     if (injectUsage) {
       // OpenAI 系接口默认不在流式响应里返回 usage，需显式开启才能精确计费
       const existing = body.stream_options;
@@ -678,6 +722,12 @@ async function attemptChannel(
     const message = `HTTP ${upstream.status}: ${detail.slice(0, 300)}`;
     const verdict = classifyUpstreamError(upstream.status, detail);
 
+    // 路由降级：上游根本没有这个端点（404/405）时，换下一个渠道，而不是把渠道
+    // 判成故障冷却掉 —— 渠道本身没坏，只是不认这个协议。
+    if (target.fallbackOnMissingEndpoint && (upstream.status === 404 || upstream.status === 405)) {
+      return null;
+    }
+
     if (verdict.action === 'failover') {
       // 渠道级故障（鉴权失效、欠费、限流、模型缺失、上游故障）：冷却并按需换下一个渠道
       await markChannelFailure(env, channel, message, verdict.cooldownMs);
@@ -695,9 +745,9 @@ async function attemptChannel(
 
   if (opts.stream) {
     // 空闲看门狗沿用渠道的 timeout_ms：含义从「总时长」变成「多久没有数据」
-    return streamResponse(upstream, channel.timeout_ms);
+    return streamResponse(upstream, channel.timeout_ms, target.endpoint);
   }
-  return withBodyDeadline(() => jsonResponse(upstream, opts.model));
+  return withBodyDeadline(() => jsonResponse(upstream, opts.model, target.endpoint));
 }
 
 async function safeText(res: Response): Promise<string> {
@@ -712,6 +762,7 @@ async function safeText(res: Response): Promise<string> {
 async function jsonResponse(
   upstream: Response,
   downstreamModel: string,
+  endpoint: string,
 ): Promise<Omit<ProxyOutcome, 'channel' | 'upstreamModel' | 'attempts'>> {
   let raw: string;
   try {
@@ -738,6 +789,7 @@ async function jsonResponse(
         usage: emptyUsage(true),
         error: '上游返回非 JSON 响应',
       }),
+      endpoint,
     };
   }
 
@@ -760,6 +812,7 @@ async function jsonResponse(
   return {
     response: Response.json(parsed, { status: 200 }),
     usage: Promise.resolve({ usage, error: null }),
+    endpoint,
   };
 }
 
@@ -782,6 +835,7 @@ async function jsonResponse(
 function streamResponse(
   upstream: Response,
   idleMs: number,
+  endpoint: string,
 ): Omit<ProxyOutcome, 'channel' | 'upstreamModel' | 'attempts'> {
   const collector = new SSEUsageCollector();
   let settled = false;
@@ -802,7 +856,7 @@ function streamResponse(
   const body = upstream.body;
   if (!body) {
     settle('上游返回空响应体');
-    return { response: new Response(null, { status: 200 }), usage };
+    return { response: new Response(null, { status: 200 }), usage, endpoint };
   }
 
   const decoder = new TextDecoder();
@@ -889,7 +943,7 @@ function streamResponse(
   // 阻止中间层缓冲，保证 SSE 实时性
   headers.set('x-accel-buffering', 'no');
 
-  return { response: new Response(stream, { status: 200, headers }), usage };
+  return { response: new Response(stream, { status: 200, headers }), usage, endpoint };
 }
 
 /**

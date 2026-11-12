@@ -84,11 +84,12 @@ src/
     errors.ts       ApiError 与 OpenAI 风格错误构造器
     validate.ts     入参校验（字符串、数字、枚举、JSON 对象…）
   routes/
-    openai.ts       /v1/models、/v1/* 代理、结算
+    openai.ts       /v1/models、/v1/* 代理、/v1/responses 选路、结算
+    responses.ts    Responses ⇄ Chat 协议互转（请求翻译、响应合成、SSE 状态机）
     admin.ts        /admin/api/*（认证、总览、渠道、模型、用户、密钥、用量、设置、数据维护）
     balance.ts      /user/balance
     test.ts         /admin/api/__test__/*（仅开发构建）
-migrations/         0001…0011，只增不改
+migrations/         0001…0014，只增不改
 scripts/            部署：deploy.mjs（npm run deploy）、lib/cf.mjs（wrangler 封装 / D1 查找创建 / 生成部署配置）
 wrangler.jsonc      Worker 配置（不含 D1 库 ID）
 dev-scripts/        本地开发与测试脚本（已 gitignore，不进仓库；见第 14 节）
@@ -124,12 +125,43 @@ client ──▶ index.ts (折叠 /v1 前缀)
 失败路径同样写 `usage_logs`（`status_code` 为真实 HTTP 状态、`error` 为原因），便于事后排查；
 只有连鉴权都没通过的请求（没有 userId / keyId / model）不入库，避免匿名探测刷表。
 
-### 4.2 `/v1/models`
+### 4.2 `/v1/responses`（原生优先 + 自动降级）
+
+Responses 是 OpenAI 新协议，上游支持程度差别很大，因此走「能原生就原生，不能就翻译」：
+
+```
+                   channels.capabilities 含 responses ?
+                    ├─ 是 ──▶ POST {base}/responses      请求体原样透传，SSE 原样回传
+                    │         └ 旁路只读 usage（尾部窗口），不发 / 不改任何事件
+                    └─ 否 ──▶ POST {base}/chat/completions
+                              ├ 请求：instructions→system、input→messages、
+                              │        tools/tool_choice/text.format 逐个映射
+                              └ 响应：整包 → Response 对象；SSE → Responses 事件流
+```
+
+要点：
+
+* **端点覆盖**由 `proxyRequest` 的 `route` 钩子完成（`lib/upstream.ts` 的 `RouteContext` /
+  `RouteTarget`），渠道级决策，不改调度与熔断逻辑。
+* 原生渠道若返回 **404 / 405**（根本没有该端点），`fallbackOnMissingEndpoint` 让调度器
+  静默换下一个渠道，**不记为渠道故障** —— 渠道没坏，只是不认这个协议。
+* 翻译路径的计费口径不变：上游 chat 响应里的 `usage` 经 `extractUsage` 归一，流式照样
+  注入 `stream_options.include_usage`；原始请求的 token 数按字符估算兜底。
+* `stream: true` 时事件序列为 `response.created → response.in_progress →
+  output_item.added → content_part.added → output_text.delta* → output_text.done →
+  content_part.done → output_item.done → (function_call_arguments.delta* → .done →
+  output_item.done)* → response.completed | incomplete | failed`，每帧带单调递增的
+  `sequence_number`，`event:` 行与 `data.type` 一致。
+* `GET /v1/responses/:id` 与 `previous_response_id` 只覆盖**当前实例内存**里的最近 32 条
+  响应（按用户隔离）。取不到即 404 + `response_not_found` / `previous_response_not_found`，
+  不做跨用户可读的长期存储 —— 那需要 KV 或 D1，而这个项目承诺零额外依赖。
+
+### 4.3 `/v1/models`
 
 鉴权后列出 `models.enabled = 1` 的模型，并再过滤掉「当前没有任何启用渠道能服务」的模型
 （存在 `allow_all_models` 的启用渠道时不过滤）。响应里附带非标准的 `pricing` 字段。
 
-### 4.3 `/user/balance`
+### 4.4 `/user/balance`
 
 四种路径写法（`/user/balance`、尾斜杠、`/v1/user/balance`、尾斜杠）都指向同一处理函数。
 口径与鉴权、扣费完全一致：Key 额度优先，未设置时跟随用户额度，都取更紧的那个；
@@ -165,6 +197,8 @@ client ──▶ index.ts (折叠 /v1 前缀)
 | GET | `/admin/api/maintenance/backups[/download]` | 会话 | 列出 / 下载备份表 |
 | GET | `/v1/models` | Key | 模型清单 |
 | POST | `/v1/{chat/completions,completions,embeddings,moderations}` | Key | 转发 |
+| POST | `/v1/responses` | Key | Responses API：渠道原生则透传，否则翻译成 chat 协议 |
+| GET | `/v1/responses/:id` | Key | 取回本实例内存中缓存的响应（供 store / previous_response_id） |
 | GET | `/user/balance`, `/v1/user/balance` | Key | 查额度 |
 | * | `/admin/api/__test__/*` | 会话 | **只在开发构建**存在；正式构建返回 404 |
 
@@ -444,6 +478,9 @@ wrangler d1 migrations apply DB --remote             # 升级表结构
 ## 16. 设计取舍与已知限制
 
 - **通用透传**：只实现 OpenAI 兼容协议；Anthropic 的 `/v1/messages` 等一律 404
+- **Responses 的服务端对话很弱**：`store` / `previous_response_id` 只覆盖当前 isolate 内存里
+  最近 32 条响应，实例换了就失效（返回 `previous_response_not_found`）。真正的服务端对话
+  需要 KV / D1 持久化，与本项目「零额外依赖」的取舍冲突；客户端带完整上下文即可无限多轮
 - **RPM 是软限**：内存计数，多 isolate 下会放大；要精确限流需引入 Durable Objects（本项目刻意不引入）
 - **预扣可能残留**：Worker 在预扣与结算之间被回收时，预扣金额会留在账上（由估算上限兜住）
 - **合并会损失维度**：折成一行后，旧数据在日期 / 模型 / 渠道 / 用户维度上不可再分

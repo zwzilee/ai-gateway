@@ -1878,7 +1878,8 @@ function channelRow(ch) {
         return channelRow(ch);
       }),
       ch.cooldown_until > now ? el('span', { class: 'tag tag-sm warn', text: '熔断中' }) : null,
-      ch.allow_all_models ? el('span', { class: 'tag tag-sm accent', text: '透传全部' }) : null
+      ch.allow_all_models ? el('span', { class: 'tag tag-sm accent', text: '透传全部' }) : null,
+      hasCapability(ch, 'responses') ? el('span', { class: 'tag tag-sm', text: '原生 Responses' }) : null
     ])),
     el('td', { class: 'cell-balance' }, balanceCell(ch)),
     el('td', {}, el('div', { class: 'mono', text: ch.priority + ' / ' + ch.weight })),
@@ -1979,6 +1980,18 @@ function balanceCell(ch) {
   ]);
 }
 
+/**
+ * 渠道能力标记（空格分隔）。空串 = 只有 /v1/chat/completions，与老渠道一致。
+ */
+function hasCapability(ch, name) {
+  if (!ch || !ch.capabilities) return false;
+  return String(ch.capabilities).split(/\s+/).indexOf(name) !== -1;
+}
+
+function capabilitiesOf(nativeResponses) {
+  return nativeResponses ? 'responses chat' : '';
+}
+
 async function testChannel(ch) {
   toast('正在测试连接…');
   try {
@@ -2028,6 +2041,7 @@ function channelDialog(ch, row) {
     ]),
     allow_all_models: el('input', { type: 'checkbox', checked: Boolean(ch && ch.allow_all_models) }),
     inject_usage: el('input', { type: 'checkbox', checked: !ch || Boolean(ch.inject_usage) }),
+    native_responses: el('input', { type: 'checkbox', checked: hasCapability(ch, 'responses') }),
     register_models: el('input', { type: 'checkbox', checked: true }),
     extra_headers: el('textarea', { rows: 3, placeholder: '{ "HTTP-Referer": "https://example.com" }' }),
     mapping: el('textarea', { rows: 8 })
@@ -2219,7 +2233,8 @@ function channelDialog(ch, row) {
         ]),
         el('div', { class: 'stack', style: 'margin-bottom:13px' }, [
           el('label', { class: 'checkline' }, [f.allow_all_models, el('span', { text: '允许未登记的模型直接透传（适合聚合平台，便于临时接入新模型）' })]),
-          el('label', { class: 'checkline' }, [f.inject_usage, el('span', { text: '流式请求自动加上 include_usage 以便精确计费（推荐开启）' })])
+          el('label', { class: 'checkline' }, [f.inject_usage, el('span', { text: '流式请求自动加上 include_usage 以便精确计费（推荐开启）' })]),
+          el('label', { class: 'checkline' }, [f.native_responses, el('span', { text: '上游原生支持 /v1/responses（勾选后原样转发；不勾则网关自动翻译成 chat 协议）' })])
         ]),
         el('div', { class: 'field' }, [
           el('label', { text: '附加请求头（JSON）' }),
@@ -2257,6 +2272,7 @@ function channelDialog(ch, row) {
       allow_all_models: f.allow_all_models.checked,
       allow_insecure_http: insecureHttp,
       inject_usage: f.inject_usage.checked,
+      capabilities: capabilitiesOf(f.native_responses.checked),
       register_models: f.register_models.checked,
       models: models,
       extra_headers: extraHeaders
@@ -2284,6 +2300,7 @@ function channelDialog(ch, row) {
           allow_all_models: payload.allow_all_models,
           allow_insecure_http: payload.allow_insecure_http,
           inject_usage: payload.inject_usage,
+          capabilities: payload.capabilities,
           models: payload.models,
           extra_headers: JSON.stringify(extraHeaders)
         });

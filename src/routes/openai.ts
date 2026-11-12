@@ -1,9 +1,14 @@
 /**
  * 下游 OpenAI 兼容 API。
  *
- * 采用「通用透传」策略：任意 POST /v1/<path> 都转发到上游同名端点，因此
- * /chat/completions、/completions、/embeddings、/audio/* 等无需逐个实现。
- * 仅在转发前做三件事：鉴权、模型白名单校验、用量结算。
+ * 两种端点：
+ *
+ *   * 通用透传：POST /v1/<path> 转发到上游同名端点，/chat/completions、/completions、
+ *     /embeddings、/moderations 都是这样走的，无需逐个实现。
+ *   * 协议适配：/v1/responses 允许「原生优先、自动降级」—— 渠道支持上游 /responses
+ *     就原样转发，不支持就在网关内翻译成 /chat/completions 再翻回来（见 lib/responses.ts）。
+ *
+ * 转发前统一做三件事：鉴权、模型白名单校验、用量结算。
  */
 
 import { authenticate, reserveQuota } from '../lib/auth.js';
@@ -17,8 +22,15 @@ import {
 import { all, first, getModel, recordUsage } from '../lib/db.js';
 import { ApiError, badRequest, errorResponse, notFound } from '../lib/errors.js';
 import { canUseModel, parseAllowedModels } from '../lib/modelAccess.js';
-import { proxyRequest } from '../lib/upstream.js';
-import type { Env, ModelRow, UsageEntry } from '../types.js';
+import {
+  buildChatRequest,
+  chatStreamToResponses,
+  extractResponsesUsage,
+  responsesId,
+  validateResponsesBody,
+} from '../lib/responses.js';
+import { proxyRequest, type RouteTarget } from '../lib/upstream.js';
+import type { ChannelRow, Env, ModelRow, UsageEntry } from '../types.js';
 
 /** 下游 API 的版本前缀。转发前需要剥掉，由 buildUpstreamUrl 按上游 base_url 决定是否补回 */
 const DOWNSTREAM_PREFIX = '/v1';
@@ -29,7 +41,32 @@ const ALLOWED_ENDPOINTS = new Set([
   '/v1/completions',
   '/v1/embeddings',
   '/v1/moderations',
+  '/v1/responses',
 ]);
+
+/** 上游原生 Responses 端点（与下游同名，剥掉前缀后就是 '/responses'） */
+const RESPONSES_ENDPOINT = '/responses';
+const CHAT_ENDPOINT = '/chat/completions';
+
+/** 渠道响应协议：native = 上游原生 /responses；openai-chat = 只有 /chat/completions */
+type ResponsesMode = 'native' | 'openai-chat';
+
+/**
+ * 渠道声明支持哪些协议（channels.capabilities，空格分隔）。
+ *
+ * 缺省（空串 / NULL）表示「只有 chat」。历史上所有渠道都是这一档，
+ * 因此老数据不需要迁移语义，行为与升级前一致。
+ */
+function parseCapabilities(raw: string | null): { responses: ResponsesMode } {
+  const tokens = (raw ?? '')
+    .toLowerCase()
+    .split(/[\s,]+/)
+    .filter((t) => t !== '');
+  if (tokens.includes('responses') || tokens.includes('openai-responses')) {
+    return { responses: 'native' };
+  }
+  return { responses: 'openai-chat' };
+}
 
 export async function handleModels(request: Request, env: Env): Promise<Response> {
   const { ctx: auth } = await authenticate(request, env);
@@ -106,6 +143,113 @@ export interface BackgroundTasks {
   waitUntil(promise: Promise<unknown>): void;
 }
 
+/**
+ * Responses 的 `store` / `previous_response_id` 支撑。
+ *
+ * Workers 的 isolate 生命周期很短，这里不承诺长期存储：只在当前实例里缓存最近
+ * 若干条响应，供 store=true 的客户端随后 GET /v1/responses/:id 取回，或把
+ * previous_response_id 串起来做多轮。缓存满了按插入顺序淘汰最旧的。
+ *
+ * 命中不到（实例换了 / 已淘汰）时返回 404 + 明确的 not_found 错误，让客户端
+ * 自己决定重发全量上下文 —— 这比假装存在、返回空对话安全得多。
+ */
+const RESPONSE_CACHE_LIMIT = 32;
+const responseCache = new Map<string, { userId: number; payload: Record<string, unknown> }>();
+
+function cacheResponse(userId: number, responseId: string, payload: Record<string, unknown>): void {
+  if (!responseId) return;
+  responseCache.delete(responseId);
+  responseCache.set(responseId, { userId, payload });
+  while (responseCache.size > RESPONSE_CACHE_LIMIT) {
+    const oldest = responseCache.keys().next();
+    if (oldest.done) break;
+    responseCache.delete(oldest.value);
+  }
+}
+
+/**
+ * GET /v1/responses/:id
+ *
+ * 只回本实例缓存过的响应，且只回给同一个用户 —— 响应里含完整对话内容，
+ * 跨用户可读就是泄露。拿不到一律 404，不区分「不存在」与「不属于你」，
+ * 避免用 id 探测别人的请求。
+ */
+export async function handleGetResponse(request: Request, env: Env): Promise<Response> {
+  const { ctx: auth } = await authenticate(request, env);
+  const url = new URL(request.url);
+  const id = decodeURIComponent(url.pathname.replace(/\/+$/, '').split('/').pop() ?? '');
+  const hit = id ? responseCache.get(id) : undefined;
+  if (!hit || hit.userId !== auth.user.id) {
+    throw new ApiError(
+      404,
+      `响应「${id}」不存在：网关只在当前实例内保留最近的响应，请带上完整上下文重新请求`,
+      'invalid_request_error',
+      'response_not_found',
+      'response_id',
+    );
+  }
+  return Response.json({ ...hit.payload }, { headers: { 'x-request-id': crypto.randomUUID() } });
+}
+
+/**
+ * 把 input 归一成数组，便于和历史消息拼接。
+ *
+ * 原样保留每一项的形状 —— 消息、function_call、function_call_output 都由
+ * buildChatRequest 负责翻译，这里不做解释。
+ */
+function asInputArray(input: unknown): unknown[] {
+  if (Array.isArray(input)) return input;
+  if (typeof input === 'string') return [{ type: 'message', role: 'user', content: input }];
+  return [];
+}
+
+/**
+ * 把已有响应折回 chat 消息，供 previous_response_id 续写。
+ *
+ * 取不回来就当作没有历史（返回 null）：客户端明确给了 previous_response_id
+ * 却又拿不到时，直接报错比静默丢历史更安全，见 handleProxy 的调用点。
+ */
+function historyToMessages(payload: Record<string, unknown>): Record<string, unknown>[] {
+  const messages: Record<string, unknown>[] = [];
+  const output = payload.output;
+  if (!Array.isArray(output)) return messages;
+  for (const item of output) {
+    if (!item || typeof item !== 'object') continue;
+    const it = item as Record<string, unknown>;
+    if (it.type === 'message') {
+      const content = Array.isArray(it.content) ? it.content : [];
+      const text = content
+        .map((part) => {
+          if (!part || typeof part !== 'object') return '';
+          const p = part as Record<string, unknown>;
+          if (typeof p.text === 'string') return p.text;
+          if (typeof p.refusal === 'string') return p.refusal;
+          return '';
+        })
+        .join('');
+      if (text) messages.push({ role: 'assistant', content: text });
+    } else if (it.type === 'function_call') {
+      // 同一轮可能有多条 function_call，合并进同一条 assistant 消息的 tool_calls，
+      // 否则上游会看到「一条消息带一个调用」的碎历史
+      const call = {
+        id: typeof it.call_id === 'string' ? it.call_id : String(it.id ?? ''),
+        type: 'function',
+        function: {
+          name: typeof it.name === 'string' ? it.name : '',
+          arguments: typeof it.arguments === 'string' ? it.arguments : '{}',
+        },
+      };
+      const last = messages[messages.length - 1];
+      if (last && Array.isArray(last.tool_calls) && last.role === 'assistant') {
+        (last.tool_calls as unknown[]).push(call);
+      } else {
+        messages.push({ role: 'assistant', content: null, tool_calls: [call] });
+      }
+    }
+  }
+  return messages;
+}
+
 /** 密钥「最后使用时间」的写入间隔：距上次写入不足这个时长就不再写，省一次 D1 写入 */
 const KEY_TOUCH_INTERVAL_MS = 60_000;
 
@@ -143,6 +287,7 @@ export async function handleProxy(
       throw notFound(`不支持的端点 ${pathname}`);
     }
     const endpoint = pathname.slice(DOWNSTREAM_PREFIX.length) || '/';
+    const isResponses = endpoint === RESPONSES_ENDPOINT;
 
     const contentType = request.headers.get('content-type') ?? '';
     if (!contentType.includes('application/json')) {
@@ -164,7 +309,33 @@ export async function handleProxy(
       throw badRequest('缺少必填参数 model', 'model');
     }
     model = rawModel.trim();
+    // Responses 的流式请求同样是 stream: true；缺省时是「一次返回整包」，与非流式一致
     stream = body.stream === true ? 1 : 0;
+
+    /*
+     * previous_response_id：先把它折回 messages 拼进本次 input，再走正常链路。
+     *
+     * 拿不到历史就直接报错 —— 静默丢掉上下文会让模型答非所问，比失败更难排查。
+     */
+    if (isResponses && typeof body.previous_response_id === 'string' && body.previous_response_id) {
+      const prevId = body.previous_response_id;
+      const cached = responseCache.get(prevId);
+      if (!cached || cached.userId !== auth.user.id) {
+        throw new ApiError(
+          404,
+          `previous_response_id「${prevId}」已失效：网关只在当前实例内保留最近的响应，请把完整上下文放进 input`,
+          'invalid_request_error',
+          'previous_response_not_found',
+          'previous_response_id',
+        );
+      }
+      body = { ...body, input: [...historyToMessages(cached.payload), ...asInputArray(body.input)] };
+      delete body.previous_response_id;
+      // 历史折进来之后 input 一定非空，校验放在拼接之后才有意义
+      if (body.input === undefined) body.input = [];
+    }
+
+    if (isResponses) validateResponsesBody(body);
 
     if (!canUseModel(auth.key.allowed_models, model)) {
       throw new ApiError(
@@ -190,16 +361,68 @@ export async function handleProxy(
     // 用返回值而不是估算值：结算按「实际扣了多少」回补，见 recordUsage 的 delta
     reservedUsd = await reserveQuota(env, auth.key, auth.user, estimateRequestCost(modelRow, body));
 
+    /*
+     * 上游拿到的是「历史 + 本次 input」拼好的消息。为了把响应缓存起来供
+     * previous_response_id 续写，这里留一份原始请求的副本，不能直接用拼过的 body。
+     */
+    const requestForResponse = isResponses ? { ...body } : null;
+
+    const responseId = isResponses ? responsesId('resp') : '';
+    const route = isResponses ? responsesRoute(body, stream === 1) : undefined;
+
     const outcome = await proxyRequest(env, {
       body,
       model,
       endpoint,
       stream: stream === 1,
       signal: request.signal,
+      ...(route ? { route } : {}),
     });
 
     channelId = outcome.channel.id;
     upstreamModel = outcome.upstreamModel;
+
+    // 上游打的是 chat 端点 → 需要把结果翻译回 Responses；打的是 /responses → 原样透传
+    const needsTranslation = isResponses && outcome.endpoint === CHAT_ENDPOINT;
+    let responseBody: BodyInit | null = outcome.response.body;
+    let usagePromise = outcome.usage;
+    let responseStatus = outcome.response.status;
+
+    if (needsTranslation) {
+      const translated = chatStreamToResponses(outcome.response, {
+        request: requestForResponse ?? body,
+        model,
+        responseId,
+        stream: stream === 1,
+        idleMs: outcome.channel.timeout_ms,
+        signal: request.signal,
+      });
+      responseBody = translated.response.body;
+      responseStatus = translated.response.status;
+      usagePromise = translated.usage;
+      // 非流式翻译已经把整包 Responses 对象攒好了；store 时直接留档供后续取回
+      if (stream === 0) {
+        void translated.payload.then((payload) => {
+          if (payload) cacheResponse(auth.user.id, responseId, payload);
+        });
+      }
+    } else if (isResponses && stream === 1) {
+      // 原生透传：只旁路读 usage，不改事件流
+      const native = nativeResponsesUsage(outcome.response, outcome.channel.timeout_ms);
+      usagePromise = native.usage;
+      responseBody = native.stream;
+    } else if (isResponses) {
+      // 原生非流式：原样透传，但顺带克隆一份解析出来缓存（clone 不消耗原 body）
+      const clone = outcome.response.clone();
+      void clone
+        .json()
+        .then((payload) => {
+          if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+            cacheResponse(auth.user.id, responseId, payload as Record<string, unknown>);
+          }
+        })
+        .catch(() => undefined);
+    }
 
     const requestId = crypto.randomUUID();
     const headers = new Headers(outcome.response.headers);
@@ -207,9 +430,17 @@ export async function handleProxy(
     headers.set('x-gateway-channel', String(outcome.channel.id));
     if (outcome.attempts > 1) headers.set('x-gateway-attempts', String(outcome.attempts));
 
+    if (isResponses) {
+      headers.set('openai-processing-ms', String(Date.now() - started));
+      if (needsTranslation) {
+        headers.set('content-type', stream === 1 ? 'text/event-stream; charset=utf-8' : 'application/json; charset=utf-8');
+        headers.set('cache-control', 'no-cache');
+      }
+    }
+
     // 用量在响应体读完后才能确定，因此放进 waitUntil，不阻塞响应返回
     ctx.waitUntil(
-      settleUsage(env, outcome.usage, {
+      settleUsage(env, usagePromise, {
         requestId,
         userId,
         keyId,
@@ -217,7 +448,7 @@ export async function handleProxy(
         model,
         upstreamModel,
         latencyMs: Date.now() - started,
-        statusCode: 200,
+        statusCode: responseStatus,
         stream,
         ip,
         ua,
@@ -228,8 +459,8 @@ export async function handleProxy(
       }),
     );
 
-    return new Response(outcome.response.body, {
-      status: outcome.response.status,
+    return new Response(responseBody, {
+      status: responseStatus,
       headers,
     });
   } catch (err) {
@@ -264,6 +495,164 @@ export async function handleProxy(
     }
     return response;
   }
+}
+
+/**
+ * /v1/responses 的渠道路由。
+ *
+ *   * 渠道声明 responses 原生能力 → 打上游 /responses，请求体原样透传
+ *     （只把 stream 补上：Responses 的流式必须显式声明）
+ *   * 其余渠道 → 打 /chat/completions，请求体在 buildChatRequest 里翻译
+ *
+ * 上游若返回 404/405（没有这个端点），fallbackOnMissingEndpoint 会让调度器
+ * 静默换下一个渠道，而不是把渠道判成故障冷却 —— 渠道没坏，只是不认这个协议。
+ */
+function responsesRoute(
+  body: Record<string, unknown>,
+  stream: boolean,
+): (ctx: { channel: ChannelRow; upstreamModel: string }) => RouteTarget | null {
+  return (ctx) => {
+    const mode = parseCapabilities(ctx.channel.capabilities).responses;
+    if (mode === 'native') {
+      const passthrough: Record<string, unknown> = { ...body };
+      if (stream) passthrough.stream = true;
+      return {
+        endpoint: RESPONSES_ENDPOINT,
+        body: passthrough,
+        injectUsage: false,
+        fallbackOnMissingEndpoint: true,
+      };
+    }
+    return {
+      endpoint: CHAT_ENDPOINT,
+      body: buildChatRequest(body, ctx.upstreamModel, stream),
+      injectUsage: true,
+    };
+  };
+}
+
+/**
+ * 原生 Responses 流：原样透传，只旁路累计 usage。
+ *
+ * Responses 的流里 usage 出现在 response.completed / response.incomplete 事件的
+ * response.usage 上，个别上游还会单独发一条 usage 事件。这里不逐行解析，只保留
+ * 尾部文本（同 streamResponse 的做法），收尾时找一次 —— usage 永远在流末尾。
+ * 旁路解析失败不影响透传：resolve 的是估算值，只是标了 estimated。
+ */
+function nativeResponsesUsage(
+  upstream: Response,
+  idleMs: number,
+): { stream: ReadableStream<Uint8Array>; usage: Promise<{ usage: TokenUsage; error: string | null }> } {
+  let settled = false;
+  let resolveUsage!: (v: { usage: TokenUsage; error: string | null }) => void;
+  const usage = new Promise<{ usage: TokenUsage; error: string | null }>((resolve) => {
+    resolveUsage = resolve;
+  });
+
+  const body = upstream.body;
+  if (!body) {
+    settled = true;
+    resolveUsage({ usage: emptyUsage(true), error: '上游返回空响应体' });
+    return { stream: new Response(null).body ?? emptyStream(), usage };
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const clearIdle = (): void => {
+    if (idleTimer !== undefined) {
+      clearTimeout(idleTimer);
+      idleTimer = undefined;
+    }
+  };
+
+  const settle = (error: string | null): void => {
+    if (settled) return;
+    settled = true;
+    clearIdle();
+    resolveUsage(parseNativeUsage(text, error));
+  };
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+    },
+    async pull(c) {
+      clearIdle();
+      idleTimer = setTimeout(() => {
+        idleTimer = undefined;
+        settle(`上游 ${idleMs}ms 无数据，网关已中断本次流式响应`);
+        const err = new Error('上游空闲超时');
+        try {
+          controller?.error(err);
+        } catch {
+          /* 已关闭 */
+        }
+        void reader.cancel(err).catch(() => undefined);
+      }, idleMs);
+      try {
+        const { done: eof, value } = await reader.read();
+        clearIdle();
+        if (settled) return;
+        if (eof) {
+          settle(null);
+          c.close();
+          return;
+        }
+        text += decoder.decode(value, { stream: true });
+        // 只保留尾部窗口：usage 永远在流末尾，长回答全量保留会白吃内存
+        if (text.length > 400_000) text = text.slice(-400_000);
+        c.enqueue(value);
+      } catch (err) {
+        settle(`上游流式响应中断: ${err instanceof Error ? err.message : String(err)}`);
+        if (settled) c.error(err);
+      }
+    },
+    cancel(reason) {
+      settle(
+        `客户端提前断开（已收到 ${text.length} 字符）: ${
+          reason instanceof Error ? reason.message : String(reason ?? '')
+        }`,
+      );
+      void reader.cancel(reason).catch(() => undefined);
+    },
+  });
+
+  return { stream, usage };
+}
+
+function emptyStream(): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(c) {
+      c.close();
+    },
+  });
+}
+
+function parseNativeUsage(text: string, error: string | null): { usage: TokenUsage; error: string | null } {
+  let found: TokenUsage | null = null;
+  const lines = text.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = (lines[i] ?? '').trim();
+    if (!line.startsWith('data:')) continue;
+    const payload = line.slice(5).trim();
+    if (payload === '' || payload === '[DONE]') continue;
+    try {
+      const parsed = JSON.parse(payload) as Record<string, unknown>;
+      const usage = parsed.usage ?? (parsed.response as Record<string, unknown> | undefined)?.usage;
+      const normalized = extractResponsesUsage(usage);
+      if (normalized) {
+        found = normalized;
+        break;
+      }
+    } catch {
+      /* 忽略无法解析的行 */
+    }
+  }
+  return { usage: found ?? emptyUsage(true), error };
 }
 
 interface SettleContext {

@@ -64,6 +64,13 @@ export interface ChannelRow {
   timeout_ms: number;
   extra_headers: string;
   inject_usage: number;
+  /**
+   * 渠道支持的协议能力，空格分隔（`responses` / `chat`）。
+   *
+   * 空串表示「只有 chat/completions」—— 与升级前所有渠道的行为一致。
+   * 声明 `responses` 的渠道会被 /v1/responses 原样转发；没声明的走网关内翻译。
+   */
+  capabilities: string;
   cooldown_until: number;
   fail_count: number;
   last_error: string | null;

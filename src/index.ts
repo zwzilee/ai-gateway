@@ -6,6 +6,8 @@
  *   /admin/api/*         管理 JSON API
  *   /                     公开首页（登录入口，不再自动跳转管理后台）
  *   /v1/models            模型列表（下游鉴权）
+ *   /v1/responses         Responses API 入口（下游鉴权；原生透传或网关内翻译）
+ *   /v1/responses/:id     按 id 取回响应（当前实例内存中缓存的最近 32 条）
  *   /v1/*                 上游代理（下游鉴权）
  *
  * 不注册定时任务：用量明细的清理、会话回收、余额刷新都有对应的管理端入口，
@@ -23,7 +25,7 @@ import { apiErrorPayload, renderSetupPage } from './lib/setup.js';
 import { errorResponse } from './lib/errors.js';
 import { adminApi } from './routes/admin.js';
 import { handleUserBalance } from './routes/balance.js';
-import { handleModels, handleProxy } from './routes/openai.js';
+import { handleGetResponse, handleModels, handleProxy } from './routes/openai.js';
 import type { Env } from './types.js';
 
 /**
@@ -264,6 +266,14 @@ app.get('/v1/models', (c) => handleModels(c.req.raw, c.env));
 
 // 容忍尾斜杠：部分客户端会拼出 /v1/models/
 app.get('/v1/models/', (c) => handleModels(c.req.raw, c.env));
+
+/*
+ * 取回单条响应（Responses 的 store / previous_response_id 支撑）。
+ *
+ * 必须放在 app.post('/v1/*') 之前声明：Hono 先按路径模式匹配，再按方法分发，
+ * 通配的 POST 捕获器不会吞掉这里的 GET。
+ */
+app.get('/v1/responses/:id', (c) => handleGetResponse(c.req.raw, c.env));
 
 app.post('/v1/*', (c) => handleProxy(c.req.raw, c.env, c.executionCtx));
 
