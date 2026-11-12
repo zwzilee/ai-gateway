@@ -145,6 +145,9 @@ Responses 是 OpenAI 新协议，上游支持程度差别很大，因此走「�
   `RouteTarget`），渠道级决策，不改调度与熔断逻辑。
 * 原生渠道若返回 **404 / 405**（根本没有该端点），`fallbackOnMissingEndpoint` 让调度器
   静默换下一个渠道，**不记为渠道故障** —— 渠道没坏，只是不认这个协议。
+* 反向兜底：渠道没标 `responses`、按 chat 翻译后被上游回「请改用 /v1/responses」时，
+  网关会用同一份原始请求**再走一次原生透传**（`upstream_rejected` + 消息含
+  `/v1/responses` 触发）。第一次是 4xx、不计费；标注错了也能自愈。
 * 翻译路径的计费口径不变：上游 chat 响应里的 `usage` 经 `extractUsage` 归一，流式照样
   注入 `stream_options.include_usage`；原始请求的 token 数按字符估算兜底。
 * `stream: true` 时事件序列为 `response.created → response.in_progress →

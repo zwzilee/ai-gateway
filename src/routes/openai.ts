@@ -29,7 +29,7 @@ import {
   responsesId,
   validateResponsesBody,
 } from '../lib/responses.js';
-import { proxyRequest, type RouteTarget } from '../lib/upstream.js';
+import { proxyRequest, type ProxyOutcome, type RouteTarget } from '../lib/upstream.js';
 import type { ChannelRow, Env, ModelRow, UsageEntry } from '../types.js';
 
 /** 下游 API 的版本前缀。转发前需要剥掉，由 buildUpstreamUrl 按上游 base_url 决定是否补回 */
@@ -370,14 +370,42 @@ export async function handleProxy(
     const responseId = isResponses ? responsesId('resp') : '';
     const route = isResponses ? responsesRoute(body, stream === 1) : undefined;
 
-    const outcome = await proxyRequest(env, {
-      body,
-      model,
-      endpoint,
-      stream: stream === 1,
-      signal: request.signal,
-      ...(route ? { route } : {}),
-    });
+    const modelName = model;
+    const runProxy = (routeFn?: typeof route): Promise<ProxyOutcome> =>
+      proxyRequest(env, {
+        body,
+        model: modelName,
+        endpoint,
+        stream: stream === 1,
+        signal: request.signal,
+        ...(routeFn ? { route: routeFn } : {}),
+      });
+
+    /*
+     * 兜底自愈：渠道没标 `responses` 时默认翻译成 chat 协议，但有些上游模型
+     * 只认 /v1/responses（会明确回「请改用 /v1/responses」）。碰到这种提示，
+     * 用同一份原始请求再走一次原生透传 —— 上游真没有 /responses 时会被
+     * fallbackOnMissingEndpoint 静默换渠道，不会误伤；第一次是 4xx，不产生计费。
+     */
+    let outcome: ProxyOutcome;
+    try {
+      outcome = await runProxy(route);
+    } catch (err) {
+      const shouldRetryNative =
+        isResponses &&
+        err instanceof ApiError &&
+        err.code === 'upstream_rejected' &&
+        /\/v1\/responses/i.test(err.message);
+      if (!shouldRetryNative) throw err;
+      const passthrough: Record<string, unknown> = { ...body };
+      if (stream === 1) passthrough.stream = true;
+      outcome = await runProxy(() => ({
+        endpoint: RESPONSES_ENDPOINT,
+        body: passthrough,
+        injectUsage: false,
+        fallbackOnMissingEndpoint: true,
+      }));
+    }
 
     channelId = outcome.channel.id;
     upstreamModel = outcome.upstreamModel;
