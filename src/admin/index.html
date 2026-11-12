@@ -3202,7 +3202,8 @@ viewHandlers.settings = async () => {
       el('pre', { class: 'code' }, el('code', { text: pyCode }))
     ]),
     el('div', { class: 'hint', html:
-      '支持端点：<code>/v1/chat/completions</code>、<code>/v1/completions</code>、<code>/v1/embeddings</code>、<code>/v1/moderations</code>、<code>/v1/models</code>。流式与非流式均支持。' })
+      '支持端点：<code>/v1/chat/completions</code>、<code>/v1/completions</code>、<code>/v1/embeddings</code>、<code>/v1/moderations</code>、<code>/v1/responses</code>、<code>/v1/models</code>。流式与非流式均支持。<br>' +
+      '<code>/v1/responses</code>：渠道原生支持就透传，否则网关自动翻译成 chat 协议；<code>previous_response_id</code> 与 <code>GET /v1/responses/:id</code> 只覆盖当前实例内存里最近 32 条响应。' })
   ]));
 
   return wrap;
