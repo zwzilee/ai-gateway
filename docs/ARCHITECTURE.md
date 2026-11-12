@@ -84,8 +84,9 @@ src/
     errors.ts       ApiError 与 OpenAI 风格错误构造器
     validate.ts     入参校验（字符串、数字、枚举、JSON 对象…）
   routes/
-    openai.ts       /v1/models、/v1/* 代理、/v1/responses 选路、结算
+    openai.ts       /v1/models、/v1/* 代理、/v1/responses 与 /v1/messages 选路、结算
     responses.ts    Responses ⇄ Chat 协议互转（请求翻译、响应合成、SSE 状态机）
+    anthropic.ts    Anthropic Messages ⇄ Chat 协议互转（含 count_tokens 估算与错误形状）
     admin.ts        /admin/api/*（认证、总览、渠道、模型、用户、密钥、用量、设置、数据维护）
     balance.ts      /user/balance
     test.ts         /admin/api/__test__/*（仅开发构建）
@@ -159,12 +160,45 @@ Responses 是 OpenAI 新协议，上游支持程度差别很大，因此走「�
   响应（按用户隔离）。取不到即 404 + `response_not_found` / `previous_response_not_found`，
   不做跨用户可读的长期存储 —— 那需要 KV 或 D1，而这个项目承诺零额外依赖。
 
-### 4.3 `/v1/models`
+### 4.3 `/v1/messages`（Anthropic 协议）
+
+Claude Code、Cline、Anthropic SDK 只会说 Messages 协议，而上游聚合平台大多只认
+`/chat/completions`。因此这里和 Responses 同一套思路 —— 能原生就原生，不能就翻译：
+
+```
+                   channels.capabilities 含 anthropic ?
+                    ├─ 是 ──▶ POST {base}/messages        请求体原样透传，
+                    │         认证改用 x-api-key + anthropic-version，SSE 原样回传
+                    │         └ 旁路只读 usage（message_start / message_delta 两处）
+                    └─ 否 ──▶ POST {base}/chat/completions
+                              ├ 请求：system→messages、tool_use/tool_result→tool_calls、
+                              │        image→image_url、max_tokens/stop_sequences 逐个映射
+                              └ 响应：整包 → message 对象；SSE → Anthropic 事件流
+```
+
+要点：
+
+* **认证切换**在 `buildUpstreamHeaders` 里按 `RouteTarget.auth` 决定：`x-api-key` 模式下
+  自动补 `anthropic-version`（缺省 `2023-06-01`，渠道附加头或下游请求头可覆盖）。
+* **反向兜底**同样适用：按 chat 翻译后被上游回「请改用 /v1/messages」时，用原始请求再走
+  一次原生透传（`upstream_rejected` + 消息含 `/v1/messages` 触发），第一次 4xx 不计费。
+* 原生流不能复用 `SSEUsageCollector`：它只用 `lastIndexOf('"usage"')` 取最后一段，会把
+  Anthropic 的 `input_tokens`（只在 `message_start` 里出现）丢掉。故 `anthropicPassthroughUsage`
+  单独解析 `message_start.message.usage` 与 `message_delta.usage` 后合并。
+* 翻译流的事件序列：`message_start → (content_block_start → content_block_delta* →
+  content_block_stop)* → message_delta → message_stop`；工具调用先收尾正文块再开
+  `tool_use` 块，`stop_reason` 由 `finish_reason` 映射（length→max_tokens、有工具→tool_use）。
+* `POST /v1/messages/count_tokens` 不做真实分词（没有 tokenizer），按计费预扣同一套字符
+  估算返回 `{ input_tokens }` —— 客户端只用它决定是否压缩上下文。
+* 错误形状是 Anthropic 的 `{"type":"error","error":{type,message}}`（`anthropicErrorResponse`），
+  回 OpenAI 的 `{"error":{…}}` 会让 Anthropic SDK 报「unexpected response」并吞掉错误信息。
+
+### 4.4 `/v1/models`
 
 鉴权后列出 `models.enabled = 1` 的模型，并再过滤掉「当前没有任何启用渠道能服务」的模型
 （存在 `allow_all_models` 的启用渠道时不过滤）。响应里附带非标准的 `pricing` 字段。
 
-### 4.4 `/user/balance`
+### 4.5 `/user/balance`
 
 四种路径写法（`/user/balance`、尾斜杠、`/v1/user/balance`、尾斜杠）都指向同一处理函数。
 口径与鉴权、扣费完全一致：Key 额度优先，未设置时跟随用户额度，都取更紧的那个；
@@ -202,6 +236,8 @@ Responses 是 OpenAI 新协议，上游支持程度差别很大，因此走「�
 | POST | `/v1/{chat/completions,completions,embeddings,moderations}` | Key | 转发 |
 | POST | `/v1/responses` | Key | Responses API：渠道原生则透传，否则翻译成 chat 协议 |
 | GET | `/v1/responses/:id` | Key | 取回本实例内存中缓存的响应（供 store / previous_response_id） |
+| POST | `/v1/messages` | Key | Anthropic Messages：渠道原生则透传（x-api-key），否则翻译成 chat 协议 |
+| POST | `/v1/messages/count_tokens` | Key | 估算输入 token 数（字符估算，非真实分词） |
 | GET | `/user/balance`, `/v1/user/balance` | Key | 查额度 |
 | * | `/admin/api/__test__/*` | 会话 | **只在开发构建**存在；正式构建返回 404 |
 

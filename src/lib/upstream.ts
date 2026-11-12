@@ -211,9 +211,16 @@ function sanitizeExtraHeaders(raw: Record<string, string>): Record<string, strin
   return out;
 }
 
+/**
+ * 构造上游请求头。
+ *
+ * 默认是 OpenAI 风格 `Authorization: Bearer <key>`；Anthropic 原生渠道要用
+ * `x-api-key`，并附带 `anthropic-version`（缺省 2023-06-01，渠道附加头可覆盖）。
+ */
 async function buildUpstreamHeaders(
   channel: ChannelRow,
   env: Env,
+  target?: { auth?: 'bearer' | 'x-api-key'; headers?: Record<string, string> },
 ): Promise<Record<string, string>> {
   let apiKey: string;
   try {
@@ -224,12 +231,21 @@ async function buildUpstreamHeaders(
 
   // 附加头放在前面，因此无法覆盖 authorization —— 认证方式由渠道密钥决定。
   // 需要非 Bearer 认证的平台上，可通过附加头额外补充（如 Azure 的 api-key）。
-  return {
+  const headers: Record<string, string> = {
     ...sanitizeExtraHeaders(parseExtraHeaders(channel.extra_headers)),
-    'content-type': 'application/json',
-    accept: 'application/json',
-    authorization: `Bearer ${apiKey}`,
+    ...(target?.headers ?? {}),
   };
+  headers['content-type'] = 'application/json';
+  headers.accept = 'application/json';
+
+  if (target?.auth === 'x-api-key') {
+    headers['x-api-key'] = apiKey;
+    const lower = new Set(Object.keys(headers).map((k) => k.toLowerCase()));
+    if (!lower.has('anthropic-version')) headers['anthropic-version'] = '2023-06-01';
+  } else {
+    headers.authorization = `Bearer ${apiKey}`;
+  }
+  return headers;
 }
 
 // ---------------------------------------------------------------- 渠道探测
@@ -573,6 +589,10 @@ export interface RouteTarget {
   injectUsage?: boolean;
   /** 上游没有该端点（404/405）时静默换渠道，不记渠道故障 */
   fallbackOnMissingEndpoint?: boolean;
+  /** 认证头形态：默认 Bearer；Anthropic 原生端点用 x-api-key */
+  auth?: 'bearer' | 'x-api-key';
+  /** 该端点专属的附加请求头（如 anthropic-version），会覆盖渠道附加头 */
+  headers?: Record<string, string>;
 }
 
 export interface ProxyOutcome {
@@ -646,7 +666,10 @@ async function attemptChannel(
   if (!target) return null;
 
   const url = buildUpstreamUrl(channel.base_url, target.endpoint);
-  const headers = await buildUpstreamHeaders(channel, env);
+  const headers = await buildUpstreamHeaders(channel, env, {
+    auth: target.auth,
+    headers: target.headers,
+  });
 
   const injectUsage = (target.injectUsage ?? true) && opts.stream && channel.inject_usage === 1;
   const cacheKey = `${target.endpoint}\u0000${upstreamModel}\u0000${injectUsage ? 1 : 0}`;

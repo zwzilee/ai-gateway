@@ -25,7 +25,12 @@ import { apiErrorPayload, renderSetupPage } from './lib/setup.js';
 import { errorResponse } from './lib/errors.js';
 import { adminApi } from './routes/admin.js';
 import { handleUserBalance } from './routes/balance.js';
-import { handleGetResponse, handleModels, handleProxy } from './routes/openai.js';
+import {
+  handleCountTokens,
+  handleGetResponse,
+  handleModels,
+  handleProxy,
+} from './routes/openai.js';
 import type { Env } from './types.js';
 
 /**
@@ -274,6 +279,10 @@ app.get('/v1/models/', (c) => handleModels(c.req.raw, c.env));
  * 通配的 POST 捕获器不会吞掉这里的 GET。
  */
 app.get('/v1/responses/:id', (c) => handleGetResponse(c.req.raw, c.env));
+
+// Anthropic 的 token 计数探针：Claude Code 等客户端发长上下文前会先调它。
+// 必须在 app.post('/v1/*') 之前，否则会被当成普通 Messages 请求转发出去。
+app.post('/v1/messages/count_tokens', (c) => handleCountTokens(c.req.raw, c.env));
 
 app.post('/v1/*', (c) => handleProxy(c.req.raw, c.env, c.executionCtx));
 

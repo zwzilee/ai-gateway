@@ -492,19 +492,25 @@ async function parseChannelInput(body: Record<string, unknown>): Promise<Channel
 /**
  * 「上游协议」下拉框的原值 → capabilities 字符串。
  *
- * 后台新增/编辑渠道时用它把三选一（chat / responses / both）落成能力标记；
- * 直接调 API 的老写法仍然可以只传 `capabilities`。
+ * 后台新增/编辑渠道时用它把下拉选项落成能力标记；直接调 API 的老写法
+ * 仍然可以只传 `capabilities`。
  */
 function protocolToCapabilities(raw: unknown): string {
   if (typeof raw !== 'string') return '';
   const t = raw.trim().toLowerCase();
   if (t === 'responses' || t === 'openai-responses') return 'responses';
+  if (t === 'anthropic' || t === 'claude' || t === 'messages') return 'anthropic';
+  if (t === 'anthropic-chat' || t === 'claude-chat') return 'anthropic chat';
   if (t === 'both' || t === 'all' || t === 'responses+chat') return 'responses chat';
+  if (t === 'anthropic+responses' || t === 'full') return 'anthropic responses chat';
   return '';
 }
 
 /** 允许的能力标记；未知值直接丢弃，避免脏数据进入调度判断 */
-const KNOWN_CAPABILITIES = new Set(['responses', 'chat']);
+const KNOWN_CAPABILITIES = new Set(['anthropic', 'responses', 'chat']);
+
+/** 能力标记的固定输出顺序：越靠前越「原生」，方便肉眼比对 */
+const CAPABILITY_ORDER = ['anthropic', 'responses', 'chat'];
 
 /**
  * 归一化渠道能力字段。
@@ -524,8 +530,9 @@ function parseCapabilities(raw: unknown): string {
     if (KNOWN_CAPABILITIES.has(t)) kept.add(t);
     else if (t === 'openai-responses') kept.add('responses');
     else if (t === 'openai-chat') kept.add('chat');
+    else if (t === 'claude' || t === 'messages' || t === 'anthropic-messages') kept.add('anthropic');
   }
-  return ['responses', 'chat'].filter((t) => kept.has(t)).join(' ');
+  return CAPABILITY_ORDER.filter((t) => kept.has(t)).join(' ');
 }
 
 /**

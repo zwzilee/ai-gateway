@@ -1879,7 +1879,7 @@ function channelRow(ch) {
       }),
       ch.cooldown_until > now ? el('span', { class: 'tag tag-sm warn', text: '熔断中' }) : null,
       ch.allow_all_models ? el('span', { class: 'tag tag-sm accent', text: '透传全部' }) : null,
-      hasCapability(ch, 'responses') ? el('span', { class: 'tag tag-sm', text: protocolOf(ch) === 'both' ? '双协议' : '仅 Responses' }) : null
+      protocolLabel(ch) ? el('span', { class: 'tag tag-sm', text: protocolLabel(ch) }) : null
     ])),
     el('td', { class: 'cell-balance' }, balanceCell(ch)),
     el('td', {}, el('div', { class: 'mono', text: ch.priority + ' / ' + ch.weight })),
@@ -1988,20 +1988,42 @@ function hasCapability(ch, name) {
   return String(ch.capabilities).split(/\s+/).indexOf(name) !== -1;
 }
 
-/** 把 capabilities 归一成「上游协议」选择器的三个值：chat / responses / both */
+/** 把 capabilities 归一成「上游协议」选择器的值：chat / responses / anthropic / 若干组合 */
 function protocolOf(ch) {
+  const a = hasCapability(ch, 'anthropic');
   const r = hasCapability(ch, 'responses');
   const c = hasCapability(ch, 'chat');
+  if (a && r && c) return 'full';
+  if (a && r) return 'anthropic-responses';
+  if (a && c) return 'anthropic-chat';
   if (r && c) return 'both';
+  if (a) return 'anthropic';
   if (r) return 'responses';
   return 'chat';
 }
 
 /** 「上游协议」选择值 → capabilities 字符串（空串 = 只有 chat） */
 function capabilitiesOf(protocol) {
+  if (protocol === 'full') return 'anthropic responses chat';
+  if (protocol === 'anthropic-responses') return 'anthropic responses';
+  if (protocol === 'anthropic-chat') return 'anthropic chat';
   if (protocol === 'both') return 'responses chat';
   if (protocol === 'responses') return 'responses';
+  if (protocol === 'anthropic') return 'anthropic';
   return '';
+}
+
+/** 渠道列表里的协议标签：只有 chat 时不显示 */
+function protocolLabel(ch) {
+  switch (protocolOf(ch)) {
+    case 'full': return '三协议';
+    case 'anthropic-responses': return 'Claude+Responses';
+    case 'anthropic-chat': return 'Claude+Chat';
+    case 'both': return '双协议';
+    case 'responses': return '仅 Responses';
+    case 'anthropic': return '仅 Claude';
+    default: return null;
+  }
 }
 
 async function testChannel(ch) {
@@ -2056,7 +2078,11 @@ function channelDialog(ch, row) {
     protocol: el('select', {}, [
       el('option', { value: 'chat', text: 'Chat Completions（/v1/chat/completions）— 默认', selected: protocolOf(ch) === 'chat' }),
       el('option', { value: 'responses', text: 'Responses 原生（/v1/responses）', selected: protocolOf(ch) === 'responses' }),
-      el('option', { value: 'both', text: '两者都支持（Responses 走原生，Chat 走 chat）', selected: protocolOf(ch) === 'both' })
+      el('option', { value: 'anthropic', text: 'Claude 原生（/v1/messages）', selected: protocolOf(ch) === 'anthropic' }),
+      el('option', { value: 'both', text: 'Responses + Chat（Responses 走原生，Chat 走 chat）', selected: protocolOf(ch) === 'both' }),
+      el('option', { value: 'anthropic-chat', text: 'Claude + Chat（Claude 走原生，Chat 走 chat）', selected: protocolOf(ch) === 'anthropic-chat' }),
+      el('option', { value: 'anthropic-responses', text: 'Claude + Responses', selected: protocolOf(ch) === 'anthropic-responses' }),
+      el('option', { value: 'full', text: '三种都支持（Claude / Responses / Chat 各自原生）', selected: protocolOf(ch) === 'full' })
     ]),
     register_models: el('input', { type: 'checkbox', checked: true }),
     extra_headers: el('textarea', { rows: 3, placeholder: '{ "HTTP-Referer": "https://example.com" }' }),
@@ -2213,7 +2239,7 @@ function channelDialog(ch, row) {
     el('div', { class: 'field' }, [
       el('label', { text: '上游协议' }),
       f.protocol,
-      el('div', { class: 'hint', text: '这个上游提供哪种 OpenAI 协议。选「Responses 原生」时 /v1/responses 原样转发；「两者都支持」时 Responses 走原生、Chat 走 chat；默认 Chat Completions。若选错，网关看到上游提示「请改用 /v1/responses」会自动再走一次原生。' })
+      el('div', { class: 'hint', text: '这个上游提供哪种协议。选原生（Responses / Claude）时对应端点原样转发，认证方式也自动切换（Claude 用 x-api-key）；选组合时各走原生、没列的走 chat。默认 Chat Completions。若选错，网关看到上游提示「请改用 /v1/responses 或 /v1/messages」会自动再走一次原生。' })
     ]),
 
     el('div', { class: 'divider' }),
@@ -3222,8 +3248,8 @@ viewHandlers.settings = async () => {
       el('pre', { class: 'code' }, el('code', { text: pyCode }))
     ]),
     el('div', { class: 'hint', html:
-      '支持端点：<code>/v1/chat/completions</code>、<code>/v1/completions</code>、<code>/v1/embeddings</code>、<code>/v1/moderations</code>、<code>/v1/responses</code>、<code>/v1/models</code>。流式与非流式均支持。<br>' +
-      '<code>/v1/responses</code>：渠道原生支持就透传，否则网关自动翻译成 chat 协议；<code>previous_response_id</code> 与 <code>GET /v1/responses/:id</code> 只覆盖当前实例内存里最近 32 条响应。' })
+      '支持端点：<code>/v1/chat/completions</code>、<code>/v1/completions</code>、<code>/v1/embeddings</code>、<code>/v1/moderations</code>、<code>/v1/responses</code>、<code>/v1/messages</code>（Claude）、<code>/v1/messages/count_tokens</code>、<code>/v1/models</code>。流式与非流式均支持。<br>' +
+      '<code>/v1/responses</code> 与 <code>/v1/messages</code>：渠道原生支持就透传（Claude 自动改用 <code>x-api-key</code> 认证），否则网关自动翻译成 chat 协议再翻回来；<code>previous_response_id</code> 与 <code>GET /v1/responses/:id</code> 只覆盖当前实例内存里最近 32 条响应。' })
   ]));
 
   return wrap;

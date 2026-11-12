@@ -13,6 +13,14 @@
 
 import { authenticate, reserveQuota } from '../lib/auth.js';
 import {
+  anthropicErrorResponse,
+  anthropicId,
+  anthropicPassthroughUsage,
+  buildChatRequestFromAnthropic,
+  chatStreamToAnthropic,
+  validateMessagesBody,
+} from '../lib/anthropic.js';
+import {
   computeCost,
   emptyUsage,
   estimateRequestCost,
@@ -29,7 +37,12 @@ import {
   responsesId,
   validateResponsesBody,
 } from '../lib/responses.js';
-import { proxyRequest, type ProxyOutcome, type RouteTarget } from '../lib/upstream.js';
+import {
+  proxyRequest,
+  type ProxyOutcome,
+  type RouteContext,
+  type RouteTarget,
+} from '../lib/upstream.js';
 import type { ChannelRow, Env, ModelRow, UsageEntry } from '../types.js';
 
 /** 下游 API 的版本前缀。转发前需要剥掉，由 buildUpstreamUrl 按上游 base_url 决定是否补回 */
@@ -42,14 +55,14 @@ const ALLOWED_ENDPOINTS = new Set([
   '/v1/embeddings',
   '/v1/moderations',
   '/v1/responses',
+  '/v1/messages',
 ]);
 
 /** 上游原生 Responses 端点（与下游同名，剥掉前缀后就是 '/responses'） */
 const RESPONSES_ENDPOINT = '/responses';
 const CHAT_ENDPOINT = '/chat/completions';
-
-/** 渠道响应协议：native = 上游原生 /responses；openai-chat = 只有 /chat/completions */
-type ResponsesMode = 'native' | 'openai-chat';
+/** 上游原生 Anthropic Messages 端点 */
+const ANTHROPIC_ENDPOINT = '/messages';
 
 /**
  * 渠道声明支持哪些协议（channels.capabilities，空格分隔）。
@@ -57,15 +70,18 @@ type ResponsesMode = 'native' | 'openai-chat';
  * 缺省（空串 / NULL）表示「只有 chat」。历史上所有渠道都是这一档，
  * 因此老数据不需要迁移语义，行为与升级前一致。
  */
-function parseCapabilities(raw: string | null): { responses: ResponsesMode } {
-  const tokens = (raw ?? '')
-    .toLowerCase()
-    .split(/[\s,]+/)
-    .filter((t) => t !== '');
-  if (tokens.includes('responses') || tokens.includes('openai-responses')) {
-    return { responses: 'native' };
+export function channelProtocols(channel: ChannelRow): Set<string> {
+  const raw = (channel.capabilities ?? '').trim().toLowerCase();
+  if (raw === '') return new Set(['chat']);
+  const out = new Set<string>();
+  for (const token of raw.split(/[\s,]+/)) {
+    if (token === '') continue;
+    if (token === 'openai-chat') out.add('chat');
+    else if (token === 'openai-responses') out.add('responses');
+    else out.add(token);
   }
-  return { responses: 'openai-chat' };
+  if (out.size === 0) out.add('chat');
+  return out;
 }
 
 export async function handleModels(request: Request, env: Env): Promise<Response> {
@@ -109,6 +125,33 @@ export async function handleModels(request: Request, env: Env): Promise<Response
       },
     })),
   });
+}
+
+/**
+ * `POST /v1/messages/count_tokens`
+ *
+ * Anthropic SDK / Claude Code 在发送长上下文前会先探一次 token 数。这里不做
+ * 真实分词（没有 tokenizer），按与计费预扣同一套估算（billing.estimateTokens）
+ * 给个数 —— 客户端只用它来决定是否压缩上下文，误差不影响正确性。
+ */
+export async function handleCountTokens(request: Request, env: Env): Promise<Response> {
+  try {
+    await authenticate(request, env);
+    const contentType = request.headers.get('content-type') ?? '';
+    if (!contentType.includes('application/json')) {
+      throw badRequest('请求体必须是 application/json');
+    }
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      throw badRequest('请求体不是合法 JSON');
+    }
+    const inputTokens = estimateTokensFromBody(body);
+    return Response.json({ input_tokens: inputTokens });
+  } catch (err) {
+    return anthropicErrorResponse(err);
+  }
 }
 
 /**
@@ -267,6 +310,8 @@ export async function handleProxy(
   let upstreamModel: string | null = null;
   let stream = 0;
   let reservedUsd = 0;
+  /** 本次请求是否是 Anthropic Messages —— 出错时要按 Anthropic 的格式回 */
+  let isMessagesRequest = false;
 
   const ip = request.headers.get('cf-connecting-ip') ?? '';
   const ua = request.headers.get('user-agent') ?? '';
@@ -288,6 +333,8 @@ export async function handleProxy(
     }
     const endpoint = pathname.slice(DOWNSTREAM_PREFIX.length) || '/';
     const isResponses = endpoint === RESPONSES_ENDPOINT;
+    const isMessages = endpoint === ANTHROPIC_ENDPOINT;
+    isMessagesRequest = isMessages;
 
     const contentType = request.headers.get('content-type') ?? '';
     if (!contentType.includes('application/json')) {
@@ -336,6 +383,7 @@ export async function handleProxy(
     }
 
     if (isResponses) validateResponsesBody(body);
+    if (isMessages) validateMessagesBody(body);
 
     if (!canUseModel(auth.key.allowed_models, model)) {
       throw new ApiError(
@@ -368,7 +416,12 @@ export async function handleProxy(
     const requestForResponse = isResponses ? { ...body } : null;
 
     const responseId = isResponses ? responsesId('resp') : '';
-    const route = isResponses ? responsesRoute(body, stream === 1) : undefined;
+    const anthropicVersion = request.headers.get('anthropic-version') || '2023-06-01';
+    const route: (ctx: RouteContext) => RouteTarget | null = isResponses
+      ? responsesRoute(body, stream === 1)
+      : isMessages
+        ? messagesRoute(body, stream === 1, anthropicVersion)
+        : chatRoute(endpoint);
 
     const modelName = model;
     const runProxy = (routeFn?: typeof route): Promise<ProxyOutcome> =>
@@ -382,41 +435,52 @@ export async function handleProxy(
       });
 
     /*
-     * 兜底自愈：渠道没标 `responses` 时默认翻译成 chat 协议，但有些上游模型
-     * 只认 /v1/responses（会明确回「请改用 /v1/responses」）。碰到这种提示，
-     * 用同一份原始请求再走一次原生透传 —— 上游真没有 /responses 时会被
+     * 兜底自愈：渠道没标对应协议能力时默认翻译成 chat 协议，但有些上游模型
+     * 只认自己的原生端点（会明确回「请改用 /v1/responses」或 /v1/messages）。
+     * 碰到这种提示，用同一份原始请求再走一次原生透传 —— 上游真没有该端点时会被
      * fallbackOnMissingEndpoint 静默换渠道，不会误伤；第一次是 4xx，不产生计费。
      */
     let outcome: ProxyOutcome;
     try {
       outcome = await runProxy(route);
     } catch (err) {
-      const shouldRetryNative =
-        isResponses &&
-        err instanceof ApiError &&
-        err.code === 'upstream_rejected' &&
-        /\/v1\/responses/i.test(err.message);
-      if (!shouldRetryNative) throw err;
+      const rejected =
+        err instanceof ApiError && err.code === 'upstream_rejected' ? err.message : '';
+      const retryResponses = isResponses && /\/v1\/responses/i.test(rejected);
+      const retryMessages = isMessages && /\/v1\/messages/i.test(rejected);
+      if (!retryResponses && !retryMessages) throw err;
+
       const passthrough: Record<string, unknown> = { ...body };
       if (stream === 1) passthrough.stream = true;
-      outcome = await runProxy(() => ({
-        endpoint: RESPONSES_ENDPOINT,
-        body: passthrough,
-        injectUsage: false,
-        fallbackOnMissingEndpoint: true,
-      }));
+      outcome = await runProxy(() =>
+        retryMessages
+          ? {
+              endpoint: ANTHROPIC_ENDPOINT,
+              body: passthrough,
+              injectUsage: false,
+              fallbackOnMissingEndpoint: true,
+              auth: 'x-api-key',
+              headers: { 'anthropic-version': anthropicVersion },
+            }
+          : {
+              endpoint: RESPONSES_ENDPOINT,
+              body: passthrough,
+              injectUsage: false,
+              fallbackOnMissingEndpoint: true,
+            },
+      );
     }
 
     channelId = outcome.channel.id;
     upstreamModel = outcome.upstreamModel;
 
-    // 上游打的是 chat 端点 → 需要把结果翻译回 Responses；打的是 /responses → 原样透传
-    const needsTranslation = isResponses && outcome.endpoint === CHAT_ENDPOINT;
+    // 上游打的是 chat 端点 → 需要把结果翻译成下游协议；打的是原生端点 → 原样透传
+    const needsTranslation = (isResponses || isMessages) && outcome.endpoint === CHAT_ENDPOINT;
     let responseBody: BodyInit | null = outcome.response.body;
     let usagePromise = outcome.usage;
     let responseStatus = outcome.response.status;
 
-    if (needsTranslation) {
+    if (needsTranslation && isResponses) {
       const translated = chatStreamToResponses(outcome.response, {
         request: requestForResponse ?? body,
         model,
@@ -434,9 +498,26 @@ export async function handleProxy(
           if (payload) cacheResponse(auth.user.id, responseId, payload);
         });
       }
+    } else if (needsTranslation) {
+      const translated = chatStreamToAnthropic(outcome.response, {
+        request: requestForResponse ?? body,
+        model,
+        messageId: anthropicId('msg'),
+        stream: stream === 1,
+        idleMs: outcome.channel.timeout_ms,
+        signal: request.signal,
+      });
+      responseBody = translated.response.body;
+      responseStatus = translated.response.status;
+      usagePromise = translated.usage;
     } else if (isResponses && stream === 1) {
       // 原生透传：只旁路读 usage，不改事件流
       const native = nativeResponsesUsage(outcome.response, outcome.channel.timeout_ms);
+      usagePromise = native.usage;
+      responseBody = native.stream;
+    } else if (isMessages && stream === 1) {
+      // 原生 Anthropic 流：原样透传（含 event: 行），只在末尾旁路解析 usage
+      const native = anthropicPassthroughUsage(outcome.response, outcome.channel.timeout_ms);
       usagePromise = native.usage;
       responseBody = native.stream;
     } else if (isResponses) {
@@ -460,10 +541,10 @@ export async function handleProxy(
 
     if (isResponses) {
       headers.set('openai-processing-ms', String(Date.now() - started));
-      if (needsTranslation) {
-        headers.set('content-type', stream === 1 ? 'text/event-stream; charset=utf-8' : 'application/json; charset=utf-8');
-        headers.set('cache-control', 'no-cache');
-      }
+    }
+    if (needsTranslation) {
+      headers.set('content-type', stream === 1 ? 'text/event-stream; charset=utf-8' : 'application/json; charset=utf-8');
+      headers.set('cache-control', 'no-cache');
     }
 
     // 用量在响应体读完后才能确定，因此放进 waitUntil，不阻塞响应返回
@@ -492,7 +573,7 @@ export async function handleProxy(
       headers,
     });
   } catch (err) {
-    const response = errorResponse(err);
+    const response = isMessagesRequest ? anthropicErrorResponse(err) : errorResponse(err);
     const status = response.status;
 
     if (userId != null || keyId != null || model != null) {
@@ -540,8 +621,7 @@ function responsesRoute(
   stream: boolean,
 ): (ctx: { channel: ChannelRow; upstreamModel: string }) => RouteTarget | null {
   return (ctx) => {
-    const mode = parseCapabilities(ctx.channel.capabilities).responses;
-    if (mode === 'native') {
+    if (channelProtocols(ctx.channel).has('responses')) {
       const passthrough: Record<string, unknown> = { ...body };
       if (stream) passthrough.stream = true;
       return {
@@ -557,6 +637,43 @@ function responsesRoute(
       injectUsage: true,
     };
   };
+}
+
+/**
+ * /v1/messages 的渠道路由。
+ *
+ *   * 渠道声明 anthropic 能力 → 打上游 /messages，请求体原样透传，改用 x-api-key 认证
+ *   * 其余渠道 → 打 /chat/completions，请求体在 buildChatRequestFromAnthropic 里翻译
+ */
+function messagesRoute(
+  body: Record<string, unknown>,
+  stream: boolean,
+  anthropicVersion: string,
+): (ctx: { channel: ChannelRow; upstreamModel: string }) => RouteTarget | null {
+  return (ctx) => {
+    if (channelProtocols(ctx.channel).has('anthropic')) {
+      const passthrough: Record<string, unknown> = { ...body };
+      if (stream) passthrough.stream = true;
+      return {
+        endpoint: ANTHROPIC_ENDPOINT,
+        body: passthrough,
+        injectUsage: false,
+        fallbackOnMissingEndpoint: true,
+        auth: 'x-api-key',
+        headers: { 'anthropic-version': anthropicVersion },
+      };
+    }
+    return {
+      endpoint: CHAT_ENDPOINT,
+      body: buildChatRequestFromAnthropic(body, ctx.upstreamModel, stream),
+      injectUsage: true,
+    };
+  };
+}
+
+/** 其余端点（chat/completions、embeddings…）一律原样透传，按 Bearer 认证 */
+function chatRoute(endpoint: string): (ctx: RouteContext) => RouteTarget {
+  return (ctx) => ({ endpoint, body: ctx.body, injectUsage: true });
 }
 
 /**
