@@ -258,6 +258,21 @@ describe('chatStreamToAnthropic 流式', () => {
     expect(result.response.status).toBe(200);
     await expect(new Response(result.response.body).text()).resolves.toBe('');
   });
+
+  test('非流式下游 + 上游返回整包 chat JSON 也能折叠（不是 SSE）', async () => {
+    const upstream = new Response(
+      JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: 'hi from chat' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 6, completion_tokens: 3, total_tokens: 9 },
+      }),
+      { headers: { 'content-type': 'application/json' } },
+    );
+    const result = chatStreamToAnthropic(upstream, { ...base, stream: false });
+    const body = (await new Response(result.response.body).json()) as Record<string, unknown>;
+    expect(body.type).toBe('message');
+    expect(body.content).toEqual([{ type: 'text', text: 'hi from chat' }]);
+    expect(body.usage).toEqual({ input_tokens: 6, output_tokens: 3 });
+  });
 });
 
 describe('validateMessagesBody', () => {

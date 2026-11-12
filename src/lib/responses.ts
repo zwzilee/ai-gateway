@@ -652,6 +652,39 @@ export function chatStreamToResponses(upstream: Response, opts: ResponsesStreamO
     });
     return { response: new Response(empty, { status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8' } }), usage, payload };
   }
+  // 非流式下游 + 上游回的是整包 JSON（chat.completion）：上游没有 SSE 可解，
+  // 直接按整包转换。少了这一支，下游要非流式时会拿到空 output、用量全靠估算。
+  const contentType = upstream.headers.get('content-type') ?? '';
+  if (!opts.stream && !contentType.includes('event-stream')) {
+    const pending = (async (): Promise<Json> => {
+      let chat: Json = {};
+      try {
+        chat = JSON.parse(await upstream.text()) as Json;
+      } catch {
+        chat = {};
+      }
+      const responseObject = chatToResponse(chat, opts.request, opts.model, opts.responseId);
+      const used = extractUsage(isObject(chat.usage) ? chat.usage : null) ?? estimatedUsage(opts.request, '');
+      resolveUsage({ usage: used, error: null });
+      resolvePayload(responseObject);
+      return responseObject;
+    })();
+    const plain = new Response(
+      new ReadableStream<Uint8Array>({
+        async start(c) {
+          try {
+            c.enqueue(encoder.encode(JSON.stringify(await pending)));
+            c.close();
+          } catch (err) {
+            c.error(err);
+          }
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } },
+    );
+    return { response: plain, usage, payload };
+  }
+
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';

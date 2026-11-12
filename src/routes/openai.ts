@@ -476,7 +476,10 @@ export async function handleProxy(
 
     // 上游打的是 chat 端点 → 需要把结果翻译成下游协议；打的是原生端点 → 原样透传
     const needsTranslation = (isResponses || isMessages) && outcome.endpoint === CHAT_ENDPOINT;
-    let responseBody: BodyInit | null = outcome.response.body;
+    // 注意：不能在这里就取 outcome.response.body —— 非流式原生分支会 clone()，
+    // 而 clone() 会重新挂载原响应的内部 body，先前取到的那个流随即变成「已扰动」，
+    // 再拿去 new Response() 会抛 TypeError: Response body object should not be disturbed or locked。
+    let responseBody: BodyInit | null = null;
     let usagePromise = outcome.usage;
     let responseStatus = outcome.response.status;
 
@@ -532,6 +535,9 @@ export async function handleProxy(
         })
         .catch(() => undefined);
     }
+
+    // 其余路径（纯 chat 透传、原生 messages 非流式…）直接用上游响应体
+    if (responseBody === null) responseBody = outcome.response.body;
 
     const requestId = crypto.randomUUID();
     const headers = new Headers(outcome.response.headers);

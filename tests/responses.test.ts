@@ -507,4 +507,27 @@ describe('chatStreamToResponses / 流式', () => {
     const settled = await usage;
     expect(settled.error).not.toBeNull();
   });
+
+  test('非流式下游 + 上游返回整包 chat JSON 也能折叠（不是 SSE）', async () => {
+    const upstream = new Response(
+      JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: '整包回复' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 7, completion_tokens: 4, total_tokens: 11 },
+      }),
+      { headers: { 'content-type': 'application/json' } },
+    );
+    const { response, usage, payload } = chatStreamToResponses(upstream, {
+      request: { model: 'm', input: 'hi' },
+      model: 'downstream',
+      responseId: 'resp_s7',
+      stream: false,
+      idleMs: 5000,
+    });
+    const body = JSON.parse(await response.text());
+    expect(body.output[0].content[0].text).toBe('整包回复');
+    const settled = await usage;
+    expect(settled.usage.promptTokens).toBe(7);
+    expect(settled.usage.completionTokens).toBe(4);
+    expect(await payload).not.toBeNull();
+  });
 });
